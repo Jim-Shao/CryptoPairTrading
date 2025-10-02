@@ -1,0 +1,114 @@
+#
+# File Name: utils.py
+# Create Time: 2025-09-29 23:04:08
+# Modified Time: 2025-10-01 14:53:41
+#
+
+
+import os
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+from pandas.api.types import is_numeric_dtype
+from statsmodels.tsa.stattools import adfuller
+
+
+def load_crypto_dir(
+    data_dir: str, start_date: str = None, end_date: str = None
+) -> dict:
+    """
+    data_dir/symbol/freq/*.csv -> dict of DataFrames.
+    Parses 'open_time' to datetime and filters to [start_date, end_date] if provided.
+    """
+    sd = pd.to_datetime(start_date) if start_date else None
+    ed = pd.to_datetime(end_date) if end_date else None
+
+    out = {}
+    for symbol in sorted(os.listdir(data_dir)):
+        spath = os.path.join(data_dir, symbol)
+        if not os.path.isdir(spath):
+            continue
+        for freq in sorted(os.listdir(spath)):
+            fpath = os.path.join(spath, freq)
+            if not os.path.isdir(fpath):
+                continue
+            frames = []
+            for fn in sorted(os.listdir(fpath)):
+                if fn.endswith(".csv"):
+                    frames.append(pd.read_csv(os.path.join(fpath, fn)))
+            if not frames:
+                continue
+
+            df = (
+                pd.concat(frames, ignore_index=True)
+                .drop_duplicates()
+                .reset_index(drop=True)
+            )
+
+            if "open_time" in df.columns:
+                if is_numeric_dtype(df["open_time"]):
+                    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+                else:
+                    df["open_time"] = pd.to_datetime(df["open_time"], errors="coerce")
+                if sd is not None or ed is not None:
+                    m = pd.Series(True, index=df.index)
+                    if sd is not None:
+                        m &= df["open_time"] >= sd
+                    if ed is not None:
+                        m &= df["open_time"] <= ed
+                    df = df.loc[m].reset_index(drop=True)
+
+            if not df.empty:
+                out[f"{symbol}_{freq}"] = df
+    return out
+
+
+def preprocess_ohlc(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df = df.sort_values("open_time").reset_index(drop=True)
+    df = df[["open_time", "close", "volume"]]
+    df["log_close"] = np.log(df["close"])
+    return df
+
+
+def align_two(
+    df1: pd.DataFrame, df2: pd.DataFrame, coint_var: str = "log_close"
+) -> pd.DataFrame:
+    """Align by time; keep coint_var_1/2 and close_1/2."""
+    m = pd.merge(
+        df1[["open_time", coint_var, "close"]].rename(
+            columns={coint_var: f"{coint_var}_1", "close": "close_1"}
+        ),
+        df2[["open_time", coint_var, "close"]].rename(
+            columns={coint_var: f"{coint_var}_2", "close": "close_2"}
+        ),
+        on="open_time",
+        how="inner",
+    )
+    return m.dropna().reset_index(drop=True)
+
+
+def adf_pvalue(series: pd.Series) -> float:
+    """Return p-value from ADF test (lower means more likely stationary)."""
+    series = pd.Series(series).dropna()
+    if len(series) < 3:
+        return np.nan
+    return float(adfuller(series, autolag="AIC")[1])
+
+
+def fit_coint(train: pd.DataFrame, coint_var: str) -> dict:
+    """OLS y = beta0 + beta1 * x, return params, residual sigma, and ADF p-value."""
+    y = train[f"{coint_var}_1"]
+    X = sm.add_constant(train[f"{coint_var}_2"])
+    model = sm.OLS(y, X).fit()
+    beta0 = float(model.params["const"])
+    beta1 = float(model.params[f"{coint_var}_2"])
+    resid = y - model.predict(X)
+    sigma = float(resid.std())
+    pval = adf_pvalue(resid)
+    return {"beta0": beta0, "beta1": beta1, "sigma": sigma, "p_value": pval}
+
+
+def residual_on_row(beta0: float, beta1: float, y_val: float, x_val: float) -> float:
+    """Compute residual for a single bar."""
+    return float(y_val - (beta0 + beta1 * x_val))
