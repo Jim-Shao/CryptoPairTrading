@@ -41,6 +41,7 @@ import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from typing import List
 
 from urllib.request import Request, urlopen, build_opener, ProxyHandler
 from urllib.error import HTTPError, URLError
@@ -299,11 +300,11 @@ def get_pairs_spot(quote: str = "USDT") -> List[str]:
 
 if __name__ == "__main__":
     # Defaults that mirror your Bash script; can be overridden via CLI.
-    # default_cryptos = ["DOGE", "DOT", "OP", "MINA", "C98", "1INCH", "CELO", "KSM", "BAND"]
-    default_cryptos = get_pairs_spot("USDT")
+    default_cryptos = ["DOGE", "DOT", "OP", "MINA", "C98", "1INCH", "CELO", "KSM", "BAND"]
+    # default_cryptos = get_pairs_spot("USDT")
     default_quotes = ["USDT"]
     default_data_types = ["futures"]
-    default_begin = "2022-09"
+    default_begin = "2022-08"
     default_end = "2025-08"
     default_interval = "1h"
     default_save = "data"

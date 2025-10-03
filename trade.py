@@ -107,6 +107,7 @@ class Account:
         self.entry_x = None
         self.entry_beta1 = None  # log beta at entry (for reference)
         self.entry_sigma = None  # log residual sigma at entry
+        self.entry_residual = None  # log residual at entry
         self.entry_time = None
 
         # fixed quantities after entry
@@ -137,7 +138,13 @@ class Account:
         return q_y, q_x
 
     def open_long(
-        self, y_price: float, x_price: float, beta1_log: float, sigma_log: float, t
+        self,
+        y_price: float,
+        x_price: float,
+        beta1_log: float,
+        sigma_log: float,
+        t,
+        entry_residual: float,
     ) -> None:
         """Open long spread: +y, -x using margin-capped sizing."""
         self.state = "long"
@@ -147,6 +154,7 @@ class Account:
         self.entry_beta1 = float(beta1_log)
         self.entry_sigma = float(sigma_log)
         self.entry_time = t
+        self.entry_residual = float(entry_residual)
 
         h_units = self._units_ratio(self.entry_beta1, self.entry_y, self.entry_x)
         self.qty_y, self.qty_x = self._size_by_margin(
@@ -157,7 +165,13 @@ class Account:
         self.entry_margin = self.m * self.entry_gross
 
     def open_short(
-        self, y_price: float, x_price: float, beta1_log: float, sigma_log: float, t
+        self,
+        y_price: float,
+        x_price: float,
+        beta1_log: float,
+        sigma_log: float,
+        t,
+        entry_residual: float,
     ) -> None:
         """Open short spread: -y, +x using margin-capped sizing."""
         self.state = "short"
@@ -167,6 +181,7 @@ class Account:
         self.entry_beta1 = float(beta1_log)
         self.entry_sigma = float(sigma_log)
         self.entry_time = t
+        self.entry_residual = float(entry_residual)
 
         h_units = self._units_ratio(self.entry_beta1, self.entry_y, self.entry_x)
         self.qty_y, self.qty_x = self._size_by_margin(
@@ -207,17 +222,22 @@ class Account:
             # cross downward through +level
             return (prev_resid > level) and (curr_resid <= level)
 
-    # New: hard stop-loss based on residual moving further in the adverse direction
+    # Stop-loss: residual moves stop_k * sigma further against the entry residual
     def should_stop_loss(self, curr_resid: float | None, stop_k: float) -> bool:
-        if self.state == "flat" or self.entry_sigma is None or curr_resid is None:
+        if (
+            self.state == "flat"
+            or self.entry_sigma is None
+            or self.entry_residual is None
+            or curr_resid is None
+        ):
             return False
-        level = stop_k * self.entry_sigma
+        delta = stop_k * self.entry_sigma
         if self.state == "long":
-            # long entered on the negative side; more negative is worse
-            return curr_resid <= -level
+            # long: entry residual is negative; more negative than entry by delta -> stop
+            return curr_resid <= (self.entry_residual - delta)
         else:
-            # short entered on the positive side; more positive is worse
-            return curr_resid >= level
+            # short: entry residual is positive; more positive than entry by delta -> stop
+            return curr_resid >= (self.entry_residual + delta)
 
     def close_position(self, y_price: float, x_price: float) -> None:
         equity = self.mark_to_market(y_price, x_price)
@@ -228,6 +248,7 @@ class Account:
         self.entry_y = self.entry_x = None
         self.entry_beta1 = None
         self.entry_sigma = None
+        self.entry_residual = None
         self.entry_time = None
         self.qty_y = 0.0
         self.qty_x = 0.0
@@ -246,7 +267,8 @@ class CointBacktester:
       - On each reset day, re-check cointegration with the current fixed beta over the last train_len bars.
         * If flat: use strict pval_alpha; if it fails, switch to a newly refit beta immediately.
         * If in position: use relaxed_pval_alpha; if it fails, force close the position, then refit/switch beta.
-      - Stop-loss line stop_k while in a position (stop has higher priority than the crossing exit).
+      - Stop-loss stop_k that triggers when residual drifts stop_k * sigma further against the entry residual
+        (higher priority than the crossing exit).
     """
 
     def __init__(
@@ -264,6 +286,7 @@ class CointBacktester:
         # New:
         relaxed_pval_alpha: float = 0.10,  # looser threshold while holding
         stop_k: float = 3.0,  # stop-loss multiple relative to entry_sigma
+        stop_loss_cooling_days: float = 0.0,  # cooling period after stop loss
         initial_balance: float = 1_000_000.0,
         trade_frac: float = 0.10,
         margin_rate: float = 0.10,
@@ -287,6 +310,15 @@ class CointBacktester:
         # New:
         self.relaxed_pval_alpha = float(relaxed_pval_alpha)
         self.stop_k = float(stop_k)
+        self.stop_loss_cooling_days = float(stop_loss_cooling_days)
+        self.stop_loss_cooling = (
+            pd.Timedelta(days=self.stop_loss_cooling_days)
+            if self.stop_loss_cooling_days > 0
+            else None
+        )
+
+        # prevent rapid re-entry after a stop-loss
+        self.cooldown_until_time: pd.Timestamp | None = None
 
         self.account = Account(
             initial_balance=initial_balance,
@@ -347,6 +379,8 @@ class CointBacktester:
         # regime validity window: [d, d+gap-1] after each fit at day d
         regime_valid_to = None  # inclusive bar index
         prev_residual = None  # for crossing exit logic
+        # ensure clean start if run() is called multiple times on same instance
+        self.cooldown_until_time = None
 
         for bar_idx in range(self.start_idx, self.end_idx + 1):
             bar = self.ex.get_bar(bar_idx)
@@ -371,6 +405,13 @@ class CointBacktester:
             fixed_beta_check_done = False
             fixed_beta_failed = False
             fixed_beta_threshold_used = None  # pval_alpha or relaxed_pval_alpha
+            cooling_active_today = False
+
+            if self.cooldown_until_time is not None:
+                if pd.Timestamp(time) < self.cooldown_until_time:
+                    cooling_active_today = True
+                else:
+                    self.cooldown_until_time = None
 
             # 1) residual based on current regime, if available
             if self.regime.beta0 is not None and self.regime.beta1 is not None:
@@ -402,6 +443,8 @@ class CointBacktester:
                 if (fixed_beta_p is not None) and (fixed_beta_p >= thr):
                     fixed_beta_failed = True
 
+            exit_flag = False
+
             # 3) if fixed-beta check fails and we are holding a position, force close first
             force_close_reason = None
             equity_view = self.account.mark_to_market(y_close, x_close)
@@ -409,6 +452,7 @@ class CointBacktester:
                 self.account.close_position(y_close, x_close)
                 equity_view = self.account.cash
                 force_close_reason = "no_longer_coint"
+                exit_flag = True
 
             # 4) if fixed-beta check fails (flat or after force-close), refit and switch to a new beta now
             regime_switched = False
@@ -447,14 +491,17 @@ class CointBacktester:
                 )
 
             # 5) during a position, exit priority: stop-loss first, then crossing-based exit
-            exit_flag = False
-            if self.account.state != "flat" and residual_today is not None:
+            if not exit_flag and self.account.state != "flat" and residual_today is not None:
                 # (a) stop-loss
                 if self.account.should_stop_loss(residual_today, self.stop_k):
                     self.account.close_position(y_close, x_close)
                     equity_view = self.account.cash
                     exit_flag = True
                     force_close_reason = "stop_loss"
+                    if self.stop_loss_cooling is not None:
+                        base_time = pd.Timestamp(time)
+                        self.cooldown_until_time = base_time + self.stop_loss_cooling
+                        cooling_active_today = True
 
                 # (b) crossing exit (only if not stopped out)
                 elif self.account.should_exit_cross(
@@ -507,7 +554,10 @@ class CointBacktester:
                 and (bar_idx >= self.regime.valid_from)
             )
             entry_allowed_today = bool(
-                self.regime.active and in_regime_window and self.account.can_enter()
+                self.regime.active
+                and in_regime_window
+                and self.account.can_enter()
+                and not cooling_active_today
             )
 
             # 8) entry logic (unchanged apart from using possibly updated regime params)
@@ -528,7 +578,12 @@ class CointBacktester:
                 if residual_today >= self.entry_k * sigma_today:
                     # short spread
                     self.account.open_short(
-                        y_close, x_close, beta1_today, sigma_today, time
+                        y_close,
+                        x_close,
+                        beta1_today,
+                        sigma_today,
+                        time,
+                        residual_today,
                     )
                     trade_signal = -1
                     entry_flag = True
@@ -536,7 +591,12 @@ class CointBacktester:
                 elif residual_today <= -self.entry_k * sigma_today:
                     # long spread
                     self.account.open_long(
-                        y_close, x_close, beta1_today, sigma_today, time
+                        y_close,
+                        x_close,
+                        beta1_today,
+                        sigma_today,
+                        time,
+                        residual_today,
                     )
                     trade_signal = +1
                     entry_flag = True
@@ -588,6 +648,8 @@ class CointBacktester:
                     "stop_k": self.stop_k,
                     "exit_k": self.exit_k,
                     "relaxed_pval_alpha": self.relaxed_pval_alpha,
+                    "cooldown_active": cooling_active_today,
+                    "cooldown_until": self.cooldown_until_time,
                 }
             )
 

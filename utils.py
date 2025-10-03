@@ -112,3 +112,48 @@ def fit_coint(train: pd.DataFrame, coint_var: str) -> dict:
 def residual_on_row(beta0: float, beta1: float, y_val: float, x_val: float) -> float:
     """Compute residual for a single bar."""
     return float(y_val - (beta0 + beta1 * x_val))
+
+
+def drop_warmup_rows(
+    daily: pd.DataFrame,
+    *,
+    activity_columns: tuple[str, ...] = (
+        "entry_flag",
+        "exit_flag",
+        "trade_signal",
+        "position",
+        "fixed_beta_check_done",
+        "in_coint_period",
+    ),
+) -> pd.DataFrame:
+    """
+    Remove rows before the first trading activity so warmup bars don't affect stats.
+
+    Activity is detected via the earliest index where any listed column is truthy/non-zero.
+    If no activity found, return the DataFrame unchanged (aside from index reset).
+    """
+
+    if daily is None or daily.empty:
+        return daily
+
+    d = daily.copy()
+    first_idx: int | None = None
+
+    for col in activity_columns:
+        if col not in d.columns:
+            continue
+        series = d[col]
+        if series.dtype == bool:
+            active_mask = series
+        else:
+            active_mask = pd.to_numeric(series, errors="coerce").fillna(0) != 0
+        active_indices = d.index[active_mask]
+        if len(active_indices):
+            idx = int(active_indices[0])
+            first_idx = idx if first_idx is None else min(first_idx, idx)
+
+    if first_idx is None:
+        return d.reset_index(drop=True)
+
+    start_idx = max(first_idx - 1, 0)
+    return d.loc[start_idx:].reset_index(drop=True)

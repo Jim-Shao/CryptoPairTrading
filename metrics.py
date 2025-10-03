@@ -8,6 +8,8 @@
 import numpy as np
 import pandas as pd
 
+from utils import drop_warmup_rows
+
 
 # ---------- helpers ----------
 
@@ -61,6 +63,7 @@ def equity_to_returns(
 ) -> pd.DataFrame:
     """Add 'ret' (pct change), 'peak', 'dd' (drawdown %) to a copy of daily."""
     d = _ensure_sorted(daily.copy(), time_col)
+    d = drop_warmup_rows(d)
     eq = d[pnl_col].astype(float)
     d["ret"] = eq.pct_change()
     if fill_start is not None and len(d):
