@@ -1,7 +1,6 @@
 #
 # File Name: metrics.py
-# Create Time: 2025-10-01 15:00:29
-# Modified Time: 2025-10-01 15:35:46
+# Modified Time: 2025-10-07 04:34:34
 #
 
 
@@ -30,7 +29,13 @@ def _infer_annualization_factor(times: pd.Series) -> float:
     return float(sec_year / max(dt, 1e-9))
 
 
-def _cagr(first_value: float, last_value: float, times: pd.Series) -> float:
+def _total_return(first_value: float, last_value: float) -> float:
+    if first_value <= 0:
+        return np.nan
+    return last_value / first_value - 1.0
+
+
+def _ann_return(first_value: float, last_value: float, times: pd.Series) -> float:
     t = pd.to_datetime(times)
     years = max((t.iloc[-1] - t.iloc[0]).days / 365.25, 1e-9)
     if first_value <= 0:
@@ -40,15 +45,39 @@ def _cagr(first_value: float, last_value: float, times: pd.Series) -> float:
 
 def _drawdown_stats(equity: pd.Series):
     """Return (dd series in pct), max dd, start idx, end idx, length (bars)."""
-    peak = equity.cummax()
-    dd = equity / peak - 1.0
-    mdd = dd.min()
-    end_idx = dd.idxmin()
-    start_idx = equity.loc[:end_idx].idxmax()
-    length = (
-        int((dd.loc[start_idx:end_idx]).shape[0]) if start_idx is not None else np.nan
-    )
-    return dd, float(mdd), start_idx, end_idx, length
+    if equity is None or equity.empty:
+        return pd.Series(dtype=float), np.nan, None, None, np.nan
+
+    series = equity.astype(float)
+    peak = series.cummax()
+    dd = series / peak - 1.0
+    if dd.empty:
+        return dd, np.nan, None, None, np.nan
+
+    mdd = float(dd.min()) if len(dd) else np.nan
+    if not np.isfinite(mdd):
+        return dd, mdd, None, None, np.nan
+
+    mask = np.isclose(dd.to_numpy(), mdd, atol=1e-12, rtol=1e-9)
+    hit_indices = np.flatnonzero(mask)
+    if hit_indices.size == 0:
+        return dd, mdd, None, None, np.nan
+    first_hit_pos = int(hit_indices[0])
+    end_idx = dd.index[first_hit_pos]
+
+    start_idx = None
+    equity_up_to = series.loc[:end_idx]
+    if not equity_up_to.empty:
+        start_idx = equity_up_to.idxmax()
+
+    length = np.nan
+    if start_idx is not None and end_idx is not None:
+        if start_idx <= end_idx:
+            length = int(dd.loc[start_idx:end_idx].shape[0])
+        else:
+            length = int(dd.loc[end_idx:start_idx].shape[0])
+
+    return dd, mdd, start_idx, end_idx, length
 
 
 # ---------- public API ----------
@@ -104,15 +133,25 @@ def summarize_performance(
     eq = d[pnl_col].astype(float)
     dd_series, mdd, dd_start, dd_end, dd_len = _drawdown_stats(eq)
 
-    cagr = _cagr(eq.iloc[0], eq.iloc[-1], d[time_col])
+    total_ret = _total_return(eq.iloc[0], eq.iloc[-1])
+    ann_ret = _ann_return(eq.iloc[0], eq.iloc[-1], d[time_col])
+
+    maxdd_start_time = None
+    if dd_start is not None and dd_start in d.index:
+        maxdd_start_time = pd.to_datetime(d.loc[dd_start, time_col])
+
+    maxdd_end_time = None
+    if dd_end is not None and dd_end in d.index:
+        maxdd_end_time = pd.to_datetime(d.loc[dd_end, time_col])
 
     metrics = {
-        "CAGR": cagr,
+        "Ret": total_ret,
+        "AnnRet": ann_ret,
         "AnnVol": vol_ann,
         "Sharpe": sharpe,
         "MaxDrawdown": mdd,  # negative number, e.g., -0.23
-        "MaxDD_Start": pd.to_datetime(dd_start) if dd_start is not None else None,
-        "MaxDD_End": pd.to_datetime(dd_end) if dd_end is not None else None,
+        "MaxDD_Start": maxdd_start_time,
+        "MaxDD_End": maxdd_end_time,
         "MaxDD_Length_Bars": dd_len,
     }
     return metrics, d

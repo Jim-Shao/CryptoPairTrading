@@ -1,20 +1,24 @@
 #
 # File Name: trade.py
-# Create Time: 2025-09-29 23:05:27
-# Modified Time: 2025-10-01 14:53:54
+# Modified Time: 2025-10-07 04:34:01
 #
 
 
 import numpy as np
 import pandas as pd
-from utils import fit_coint, residual_on_row
 from statsmodels.tsa.stattools import adfuller
+
+from utils import fit_coint, residual_on_row
 
 
 class Exchange:
     """Simple exchange that streams aligned bars with fields needed by the strategy."""
 
-    def __init__(self, merged: pd.DataFrame, coint_var: str = "log_close"):
+    def __init__(
+        self,
+        merged: pd.DataFrame,
+        coint_var: str = "log_close",
+    ):
         """
         merged must contain:
           - 'open_time', 'close_1', 'close_2'
@@ -92,13 +96,22 @@ class Account:
     """
 
     def __init__(
-        self, initial_balance: float, trade_frac: float, margin_rate: float = 0.10
+        self,
+        initial_balance: float,
+        trade_frac: float,
+        margin_rate: float = 0.10,
+        fee_rate: float = 0.0,
     ):
         self.cash = float(initial_balance)
         self.trade_frac = float(trade_frac)
         self.m = float(
             margin_rate
         )  # single margin rate applied to both legs' gross notional
+
+        self.fee_rate = float(fee_rate)
+        self.cumulative_fees = 0.0
+        self.last_entry_fee = 0.0
+        self.last_exit_fee = 0.0
 
         self.state = "flat"  # "flat" | "long" | "short"
         self.notional = 0.0  # margin budget = cash * trade_frac
@@ -137,6 +150,9 @@ class Account:
         q_x = hu * q_y  # always a positive quantity
         return q_y, q_x
 
+    def _leg_fee(self, qty: float, price: float) -> float:
+        return abs(qty) * float(price) * self.fee_rate
+
     def open_long(
         self,
         y_price: float,
@@ -145,7 +161,7 @@ class Account:
         sigma_log: float,
         t,
         entry_residual: float,
-    ) -> None:
+    ) -> float:
         """Open long spread: +y, -x using margin-capped sizing."""
         self.state = "long"
         self.notional = self.cash * self.trade_frac
@@ -164,6 +180,14 @@ class Account:
         self.entry_gross = self.qty_y * self.entry_y + self.qty_x * self.entry_x
         self.entry_margin = self.m * self.entry_gross
 
+        fee_y = self._leg_fee(self.qty_y, self.entry_y)
+        fee_x = self._leg_fee(self.qty_x, self.entry_x)
+        total_fee = fee_y + fee_x
+        self.cash -= total_fee
+        self.cumulative_fees += total_fee
+        self.last_entry_fee = total_fee
+        return total_fee
+
     def open_short(
         self,
         y_price: float,
@@ -172,7 +196,7 @@ class Account:
         sigma_log: float,
         t,
         entry_residual: float,
-    ) -> None:
+    ) -> float:
         """Open short spread: -y, +x using margin-capped sizing."""
         self.state = "short"
         self.notional = self.cash * self.trade_frac
@@ -190,6 +214,14 @@ class Account:
 
         self.entry_gross = self.qty_y * self.entry_y + self.qty_x * self.entry_x
         self.entry_margin = self.m * self.entry_gross
+
+        fee_y = self._leg_fee(self.qty_y, self.entry_y)
+        fee_x = self._leg_fee(self.qty_x, self.entry_x)
+        total_fee = fee_y + fee_x
+        self.cash -= total_fee
+        self.cumulative_fees += total_fee
+        self.last_entry_fee = total_fee
+        return total_fee
 
     def mark_to_market(self, y_price: float, x_price: float) -> float:
         """Cash + unrealized PnL using fixed quantities."""
@@ -239,9 +271,18 @@ class Account:
             # short: entry residual is positive; more positive than entry by delta -> stop
             return curr_resid >= (self.entry_residual + delta)
 
-    def close_position(self, y_price: float, x_price: float) -> None:
+    def close_position(
+        self,
+        y_price: float,
+        x_price: float,
+    ) -> float:
         equity = self.mark_to_market(y_price, x_price)
-        self.cash = equity
+        fee_y = self._leg_fee(self.qty_y, y_price)
+        fee_x = self._leg_fee(self.qty_x, x_price)
+        total_fee = fee_y + fee_x
+        self.cash = equity - total_fee
+        self.cumulative_fees += total_fee
+        self.last_exit_fee = total_fee
         # reset
         self.state = "flat"
         self.notional = 0.0
@@ -254,6 +295,7 @@ class Account:
         self.qty_x = 0.0
         self.entry_gross = 0.0
         self.entry_margin = 0.0
+        return total_fee
 
 
 class CointBacktester:
@@ -290,6 +332,7 @@ class CointBacktester:
         initial_balance: float = 1_000_000.0,
         trade_frac: float = 0.10,
         margin_rate: float = 0.10,
+        fee_rate: float = 0.0,
     ):
         self.ex = exchange
         times = self.ex.time_index()
@@ -324,6 +367,7 @@ class CointBacktester:
             initial_balance=initial_balance,
             trade_frac=trade_frac,
             margin_rate=margin_rate,
+            fee_rate=fee_rate,
         )
         self.regime = CointRegime()
 
@@ -389,6 +433,8 @@ class CointBacktester:
             x_close = bar["x_close"]
             y_val = bar["y_val"]  # log-scale
             x_val = bar["x_val"]
+            entry_fee_today = 0.0
+            exit_fee_today = 0.0
 
             entry_allowed_today = False
             p_value_today = self.regime.p_value
@@ -449,7 +495,10 @@ class CointBacktester:
             force_close_reason = None
             equity_view = self.account.mark_to_market(y_close, x_close)
             if fixed_beta_failed and self.account.state != "flat":
-                self.account.close_position(y_close, x_close)
+                exit_fee_today += self.account.close_position(
+                    y_close,
+                    x_close,
+                )
                 equity_view = self.account.cash
                 force_close_reason = "no_longer_coint"
                 exit_flag = True
@@ -491,10 +540,17 @@ class CointBacktester:
                 )
 
             # 5) during a position, exit priority: stop-loss first, then crossing-based exit
-            if not exit_flag and self.account.state != "flat" and residual_today is not None:
+            if (
+                not exit_flag
+                and self.account.state != "flat"
+                and residual_today is not None
+            ):
                 # (a) stop-loss
                 if self.account.should_stop_loss(residual_today, self.stop_k):
-                    self.account.close_position(y_close, x_close)
+                    exit_fee_today += self.account.close_position(
+                        y_close,
+                        x_close,
+                    )
                     equity_view = self.account.cash
                     exit_flag = True
                     force_close_reason = "stop_loss"
@@ -509,7 +565,10 @@ class CointBacktester:
                     curr_resid=residual_today,
                     exit_k=self.exit_k,
                 ):
-                    self.account.close_position(y_close, x_close)
+                    exit_fee_today += self.account.close_position(
+                        y_close,
+                        x_close,
+                    )
                     equity_view = self.account.cash
                     exit_flag = True
 
@@ -577,7 +636,7 @@ class CointBacktester:
 
                 if residual_today >= self.entry_k * sigma_today:
                     # short spread
-                    self.account.open_short(
+                    entry_fee_today += self.account.open_short(
                         y_close,
                         x_close,
                         beta1_today,
@@ -590,7 +649,7 @@ class CointBacktester:
                     entry_side = -1
                 elif residual_today <= -self.entry_k * sigma_today:
                     # long spread
-                    self.account.open_long(
+                    entry_fee_today += self.account.open_long(
                         y_close,
                         x_close,
                         beta1_today,
@@ -638,6 +697,9 @@ class CointBacktester:
                     "state": self.account.state,
                     "qty_y": self.account.qty_y,
                     "qty_x": self.account.qty_x,
+                    "fee_entry": entry_fee_today,
+                    "fee_exit": exit_fee_today,
+                    "fees_cumulative": self.account.cumulative_fees,
                     # new: fixed-beta re-check / forced close / stop-loss
                     "fixed_beta_check_done": fixed_beta_check_done,
                     "fixed_beta_p": fixed_beta_p,

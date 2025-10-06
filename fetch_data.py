@@ -1,5 +1,8 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+#
+# File Name: fetch_data.py
+# Modified Time: 2025-10-07 04:34:48
+#
+
 
 """
 Binance historical klines downloader (Python version of your Bash script).
@@ -53,13 +56,13 @@ FUTURES_UM_BASE = "https://data.binance.vision/data/futures/um/monthly/klines"
 
 @dataclass(frozen=True)
 class Task:
-    data_type: str         # "spot" or "futures"
-    symbol: str            # e.g., "BTCUSDT"
-    interval: str          # e.g., "1h"
-    year_month: str        # "YYYY-MM"
-    url: str               # zip url
-    csv_path: str          # final csv output path
-    zip_path: str          # temp zip path on disk (we'll use in-memory by default)
+    data_type: str  # "spot" or "futures"
+    symbol: str  # e.g., "BTCUSDT"
+    interval: str  # e.g., "1h"
+    year_month: str  # "YYYY-MM"
+    url: str  # zip url
+    csv_path: str  # final csv output path
+    zip_path: str  # temp zip path on disk (we'll use in-memory by default)
 
 
 def month_add(ym: str, k: int = 1) -> str:
@@ -117,7 +120,9 @@ def default_proxy_handler(explicit_proxy: str | None) -> ProxyHandler:
     return ProxyHandler(proxies)
 
 
-def download_and_extract(task: Task, proxy: str | None, timeout: int, retries: int) -> str:
+def download_and_extract(
+    task: Task, proxy: str | None, timeout: int, retries: int
+) -> str:
     """
     Download the zip to memory, extract CSV to target folder, and return a log string.
     If csv already exists, return a 'skip' message.
@@ -127,9 +132,7 @@ def download_and_extract(task: Task, proxy: str | None, timeout: int, retries: i
         return f"{task.symbol}-{task.interval}-{task.year_month}.csv already exists, file size: {size}"
 
     opener = build_opener(default_proxy_handler(proxy))
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; BinanceKlinesDownloader/1.0)"
-    }
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; BinanceKlinesDownloader/1.0)"}
 
     last_err: Exception | None = None
     for attempt in range(1, retries + 1):
@@ -137,7 +140,13 @@ def download_and_extract(task: Task, proxy: str | None, timeout: int, retries: i
             req = Request(task.url, headers=headers)
             with opener.open(req, timeout=timeout) as resp:
                 if resp.status != 200:
-                    raise HTTPError(task.url, resp.status, f"HTTP {resp.status}", hdrs=resp.headers, fp=None)
+                    raise HTTPError(
+                        task.url,
+                        resp.status,
+                        f"HTTP {resp.status}",
+                        hdrs=resp.headers,
+                        fp=None,
+                    )
                 data = resp.read()
             # extract from zip (in-memory)
             with zipfile.ZipFile(io.BytesIO(data)) as zf:
@@ -204,7 +213,9 @@ def build_tasks(
                     url = make_url(dt, symbol, interval, ym)
                     csv_path = os.path.join(out_dir, f"{symbol}-{interval}-{ym}.csv")
                     zip_path = os.path.join(out_dir, f"{symbol}-{interval}-{ym}.zip")
-                    tasks.append(Task(dt, symbol, interval, ym, url, csv_path, zip_path))
+                    tasks.append(
+                        Task(dt, symbol, interval, ym, url, csv_path, zip_path)
+                    )
     return tasks
 
 
@@ -224,11 +235,15 @@ def run(
     months = expand_months(begin, end)
     start_time = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"====================================")
-    print(f"downloading: {','.join(cryptocurrencies)} x {','.join(quote_currencies)} "
-          f"{','.join(data_types)} data, from {months[0]} to {months[-1]}, interval: {interval}")
+    print(
+        f"downloading: {','.join(cryptocurrencies)} x {','.join(quote_currencies)} "
+        f"{','.join(data_types)} data, from {months[0]} to {months[-1]}, interval: {interval}"
+    )
     print(f"current time: {start_time}, saving to: {os.path.abspath(save_root)}")
 
-    tasks = build_tasks(cryptocurrencies, quote_currencies, data_types, months, interval, save_root)
+    tasks = build_tasks(
+        cryptocurrencies, quote_currencies, data_types, months, interval, save_root
+    )
 
     # Pretty group header like the Bash loop
     # We'll print group by (data_type, symbol)
@@ -242,7 +257,9 @@ def run(
             # sequential
             count = 0
             for t in ts:
-                msg = download_and_extract(t, proxy=proxy, timeout=timeout, retries=retries)
+                msg = download_and_extract(
+                    t, proxy=proxy, timeout=timeout, retries=retries
+                )
                 if msg.endswith("downloaded") or "downloaded, file size:" in msg:
                     count += 1
                     print(f"{count}: {msg}")
@@ -252,7 +269,10 @@ def run(
             # threaded
             count = 0
             with ThreadPoolExecutor(max_workers=threads) as ex:
-                fut2task = {ex.submit(download_and_extract, t, proxy, timeout, retries): t for t in ts}
+                fut2task = {
+                    ex.submit(download_and_extract, t, proxy, timeout, retries): t
+                    for t in ts
+                }
                 for fut in as_completed(fut2task):
                     msg = fut.result()
                     if msg.endswith("downloaded") or "downloaded, file size:" in msg:
@@ -266,20 +286,48 @@ def run(
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Download Binance monthly kline CSVs (spot/futures UM).")
-    p.add_argument("--cryptos", nargs="+", required=True, help="Base currencies, e.g. DOGE DOT OP ...")
-    p.add_argument("--quotes", nargs="+", required=True, help="Quote currencies, e.g. USDT BUSD ...")
-    p.add_argument("--data-types", nargs="+", required=True, choices=["spot", "futures"],
-                   help="Data types: spot or futures (UM).")
-    p.add_argument("--begin", required=True, help="Begin year-month (YYYY-MM), inclusive.")
+    p = argparse.ArgumentParser(
+        description="Download Binance monthly kline CSVs (spot/futures UM)."
+    )
+    p.add_argument(
+        "--cryptos",
+        nargs="+",
+        required=True,
+        help="Base currencies, e.g. DOGE DOT OP ...",
+    )
+    p.add_argument(
+        "--quotes",
+        nargs="+",
+        required=True,
+        help="Quote currencies, e.g. USDT BUSD ...",
+    )
+    p.add_argument(
+        "--data-types",
+        nargs="+",
+        required=True,
+        choices=["spot", "futures"],
+        help="Data types: spot or futures (UM).",
+    )
+    p.add_argument(
+        "--begin", required=True, help="Begin year-month (YYYY-MM), inclusive."
+    )
     p.add_argument("--end", required=True, help="End year-month (YYYY-MM), inclusive.")
-    p.add_argument("--interval", required=True, help="Kline interval, e.g. 1h / 1m / 1s ...")
+    p.add_argument(
+        "--interval", required=True, help="Kline interval, e.g. 1h / 1m / 1s ..."
+    )
     p.add_argument("--save", default="data", help="Root folder to save data.")
-    p.add_argument("--threads", type=int, default=1, help="Number of parallel download workers.")
-    p.add_argument("--proxy", default=None,
-                   help="Override proxy (e.g., http://127.0.0.1:61017 or socks5://127.0.0.1:61017). "
-                        "If omitted, system env proxies are used if present.")
-    p.add_argument("--timeout", type=int, default=30, help="Per-request timeout (seconds).")
+    p.add_argument(
+        "--threads", type=int, default=1, help="Number of parallel download workers."
+    )
+    p.add_argument(
+        "--proxy",
+        default=None,
+        help="Override proxy (e.g., http://127.0.0.1:61017 or socks5://127.0.0.1:61017). "
+        "If omitted, system env proxies are used if present.",
+    )
+    p.add_argument(
+        "--timeout", type=int, default=30, help="Per-request timeout (seconds)."
+    )
     p.add_argument("--retries", type=int, default=3, help="Download retries per file.")
     return p.parse_args(argv)
 
@@ -300,7 +348,17 @@ def get_pairs_spot(quote: str = "USDT") -> List[str]:
 
 if __name__ == "__main__":
     # Defaults that mirror your Bash script; can be overridden via CLI.
-    default_cryptos = ["DOGE", "DOT", "OP", "MINA", "C98", "1INCH", "CELO", "KSM", "BAND"]
+    default_cryptos = [
+        "DOGE",
+        "DOT",
+        "OP",
+        "MINA",
+        "C98",
+        "1INCH",
+        "CELO",
+        "KSM",
+        "BAND",
+    ]
     # default_cryptos = get_pairs_spot("USDT")
     default_quotes = ["USDT"]
     default_data_types = ["futures"]
@@ -319,8 +377,8 @@ if __name__ == "__main__":
             end=default_end,
             interval=default_interval,
             save_root=default_save,
-            threads=64,            # set >1 to enable multithreading
-            proxy=None,           # or e.g. "http://127.0.0.1:61017"
+            threads=64,  # set >1 to enable multithreading
+            proxy=None,  # or e.g. "http://127.0.0.1:61017"
             timeout=30,
             retries=3,
         )

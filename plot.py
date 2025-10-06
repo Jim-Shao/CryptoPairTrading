@@ -1,7 +1,6 @@
 #
 # File Name: plot.py
-# Create Time: 2025-09-29 23:33:51
-# Modified Time: 2025-10-01 16:01:41
+# Modified Time: 2025-10-07 04:34:30
 #
 
 
@@ -12,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from utils import drop_warmup_rows
+from metrics import summarize_performance
 
 
 _EXIT_MARKER_STYLES = {
@@ -64,15 +64,56 @@ def plot_equity_with_trades(
     times = pd.to_datetime(daily["time"])
     ax.plot(times, daily["pnl"], color="black", label="PnL")
 
-    start_eq = float(daily["pnl"].iloc[0]) if "pnl" in daily.columns else np.nan
-    end_eq = float(daily["pnl"].iloc[-1]) if "pnl" in daily.columns else np.nan
-    total_return = np.nan
-    ann_return = np.nan
-    if np.isfinite(start_eq) and start_eq > 0 and np.isfinite(end_eq) and end_eq > 0:
-        ratio = end_eq / start_eq
-        total_return = ratio - 1.0
-        years = max((times.iloc[-1] - times.iloc[0]).days / 365.25, 1e-9)
-        ann_return = ratio ** (1.0 / years) - 1.0 if years > 0 else np.nan
+    # Overlay cumulative fees (right axis) if provided.
+    fee_entry_col = daily.get("fee_entry")
+    fee_exit_col = daily.get("fee_exit")
+    per_bar_fee = None
+    if fee_entry_col is not None or fee_exit_col is not None:
+        zeros = pd.Series(0.0, index=daily.index)
+        fee_entry = fee_entry_col.fillna(0.0) if fee_entry_col is not None else zeros
+        fee_exit = fee_exit_col.fillna(0.0) if fee_exit_col is not None else zeros
+        per_bar_fee = (fee_entry + fee_exit).astype(float)
+
+    fees_cumulative_col = daily.get("fees_cumulative")
+    fees_cumulative = None
+    total_fee_cost = np.nan
+    if fees_cumulative_col is not None and len(fees_cumulative_col):
+        fees_cumulative = pd.to_numeric(fees_cumulative_col, errors="coerce")
+        fees_cumulative = (
+            fees_cumulative.replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0)
+        )
+        if len(fees_cumulative):
+            try:
+                total_fee_cost = float(fees_cumulative.iloc[-1])
+            except (TypeError, ValueError):
+                total_fee_cost = np.nan
+
+    if np.isnan(total_fee_cost) and per_bar_fee is not None and len(per_bar_fee):
+        try:
+            total_fee_cost = float(per_bar_fee.sum())
+        except (TypeError, ValueError):
+            total_fee_cost = np.nan
+
+    fee_ax = None
+    if fees_cumulative is not None and fees_cumulative.notna().any():
+        fee_ax = ax.twinx()
+        fee_ax.set_ylabel("Fees", color="tab:red")
+        fee_ax.tick_params(axis="y", colors="tab:red")
+        fee_ax.spines["right"].set_color("tab:red")
+        fee_ax.step(
+            times,
+            fees_cumulative,
+            where="post",
+            color="tab:red",
+            linewidth=1.8,
+            label="Fees (cumulative)",
+        )
+
+    perf_metrics = None
+    try:
+        perf_metrics, _ = summarize_performance(daily, pnl_col="pnl", time_col="time")
+    except Exception:
+        perf_metrics = None
 
     segs = _trade_segments_from_daily(daily)
     total_trades = len(segs)
@@ -134,14 +175,34 @@ def plot_equity_with_trades(
                 size=70,
             )
 
-    first_line_parts = [
-        f"{title}: {times.iloc[0].date()} → {times.iloc[-1].date()}"
-    ]
-    if np.isfinite(total_return):
-        first_line_parts.append(f"return={total_return:+.2%}")
-    if np.isfinite(ann_return):
-        first_line_parts.append(f"ann={ann_return:+.2%}")
-    first_line = " | ".join(first_line_parts)
+    first_line = f"{title}: {times.iloc[0].date()} → {times.iloc[-1].date()}"
+
+    second_parts: list[str] = []
+    if perf_metrics:
+        ret = perf_metrics.get("Ret")
+        if ret is not None and np.isfinite(ret):
+            second_parts.append(f"Ret={ret:+.2%}")
+        ann_ret = perf_metrics.get("AnnRet")
+        if ann_ret is not None and np.isfinite(ann_ret):
+            second_parts.append(f"AnnRet={ann_ret:+.2%}")
+        ann_vol = perf_metrics.get("AnnVol")
+        if ann_vol is not None and np.isfinite(ann_vol):
+            second_parts.append(f"AnnVol={ann_vol:.2%}")
+        sharpe = perf_metrics.get("Sharpe")
+        if sharpe is not None and np.isfinite(sharpe):
+            second_parts.append(f"Sharpe={sharpe:.2f}")
+        max_dd = perf_metrics.get("MaxDrawdown")
+        if max_dd is not None and np.isfinite(max_dd):
+            second_parts.append(f"MaxDD={max_dd:.2%}")
+        maxdd_start = perf_metrics.get("MaxDD_Start")
+        if isinstance(maxdd_start, pd.Timestamp):
+            if not pd.isna(maxdd_start):
+                second_parts.append(f"DD_start={maxdd_start.date()}")
+        maxdd_end = perf_metrics.get("MaxDD_End")
+        if isinstance(maxdd_end, pd.Timestamp):
+            if not pd.isna(maxdd_end):
+                second_parts.append(f"DD_end={maxdd_end.date()}")
+    second_line = " | ".join(second_parts) if second_parts else ""
 
     reason_order = list(_EXIT_MARKER_STYLES.keys())
     extra_reasons = sorted(set(reason_returns) - set(reason_order))
@@ -153,17 +214,31 @@ def plot_equity_with_trades(
             return "avg=—"
         return f"avg={np.mean(finite):+.2%}"
 
-    second_parts = [f"trades={total_trades}"]
+    third_parts = [f"trades={total_trades}"]
+    if np.isfinite(total_fee_cost) and not math.isclose(
+        total_fee_cost, 0.0, rel_tol=0.0, abs_tol=1e-12
+    ):
+        third_parts.append(f"fees={total_fee_cost:,.2f}")
     for reason in ordered_reasons:
         vals = reason_returns.get(reason, [])
         count = len(vals)
-        second_parts.append(f"{reason}={count} ({_avg_label(vals)})")
-    second_line = " | ".join(second_parts)
+        third_parts.append(f"{reason}={count} ({_avg_label(vals)})")
+    third_line = " | ".join(third_parts)
 
-    ax.set_title(f"{first_line}\n{second_line}")
+    title_lines = [first_line]
+    if second_line:
+        title_lines.append(second_line)
+    title_lines.append(third_line)
+    ax.set_title("\n".join(title_lines))
     ax.set_xlabel("Time")
     ax.set_ylabel("Portfolio value")
-    ax.legend()
+    handles, labels = ax.get_legend_handles_labels()
+    if fee_ax is not None:
+        fee_handles, fee_labels = fee_ax.get_legend_handles_labels()
+        handles += fee_handles
+        labels += fee_labels
+    if handles:
+        ax.legend(handles, labels)
     ax.grid(True)
 
     if save_path:
@@ -733,9 +808,7 @@ def plot_beta_and_pvalue(
     beta_series = pd.to_numeric(d.get("beta1"), errors="coerce")
     p_series = pd.to_numeric(d.get("p_value"), errors="coerce")
 
-    fig, (ax_beta, ax_p) = plt.subplots(
-        2, 1, sharex=True, figsize=(14, 7), dpi=dpi
-    )
+    fig, (ax_beta, ax_p) = plt.subplots(2, 1, sharex=True, figsize=(14, 7), dpi=dpi)
 
     ax_beta.plot(times, beta_series, color="tab:blue", label="beta1")
     entry_flags = d.get("entry_flag", pd.Series(False, index=d.index))
