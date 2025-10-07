@@ -326,233 +326,6 @@ def _trade_segments_from_daily(daily: pd.DataFrame) -> list[dict]:
     return segs
 
 
-def plot_trade_residual_paths(
-    daily: pd.DataFrame,
-    *,
-    entry_k: float = 2.0,
-    exit_cross_k: float | None = None,
-    stop_k: float | None = None,
-    max_trades: int | None = None,
-    title_prefix: str = "[Residual] Trade paths",
-    save_path: str | None = None,
-    dpi: int = 150,
-    **legacy_kwargs,
-):
-    """Per-trade residual path with entry/exit bands (log-scale)."""
-    if exit_cross_k is None:
-        exit_cross_k = float(legacy_kwargs.pop("exit_k", 0.5))
-    else:
-        legacy_kwargs.pop("exit_k", None)
-        exit_cross_k = float(exit_cross_k)
-    if stop_k is None:
-        fallback = legacy_kwargs.pop("exit_plus_k", None)
-        stop_k = float(fallback) if fallback is not None else None
-    else:
-        legacy_kwargs.pop("exit_plus_k", None)
-        stop_k = float(stop_k)
-    if legacy_kwargs:
-        raise TypeError(f"Unexpected keyword arguments: {tuple(legacy_kwargs.keys())}")
-
-    segs = _trade_segments_from_daily(daily)
-    if not segs:
-        print("No trades to plot.")
-        return
-    if max_trades is not None:
-        segs = segs[:max_trades]
-
-    n = len(segs)
-    cols = 3
-    rows = math.ceil(n / cols)
-    plt.figure(figsize=(6 * cols, 3.8 * rows))
-
-    exit_label_used: set[str] = set()
-
-    for i, seg in enumerate(segs, 1):
-        e, x = seg["entry_idx"], seg["exit_idx"]
-        window = daily.loc[e:x].reset_index(drop=True)
-        es = seg["entry_sigma"]
-        if es is None or np.isnan(es) or es <= 0:
-            continue
-
-        ax = plt.subplot(rows, cols, i)
-        ax.plot(window["time"], window["residual"], label="Residual", lw=1.5)
-
-        side = seg.get("side", 0)
-        entry_line = None
-        exit_line = None
-
-        if side == -1:  # short
-            entry_line = entry_k * es
-            exit_line = exit_cross_k * es
-        elif side == 1:  # long
-            entry_line = -entry_k * es
-            exit_line = -exit_cross_k * es
-
-        if entry_line is not None and np.isfinite(entry_line):
-            ax.axhline(
-                entry_line,
-                linestyle="--",
-                color="tab:orange",
-                label="Entry band" if i == 1 else None,
-            )
-
-        if exit_line is not None and np.isfinite(exit_line):
-            ax.axhline(
-                exit_line,
-                linestyle="--",
-                color="tab:green",
-                label="Exit band" if i == 1 else None,
-            )
-        stop_val = seg.get("stop_k")
-        if stop_val is None and stop_k is not None:
-            stop_val = stop_k
-        entry_res = seg.get("entry_residual")
-        if entry_res is None or not np.isfinite(entry_res):
-            entry_res = window["residual"].iloc[0]
-        if stop_val is not None:
-            try:
-                stop_val = float(stop_val)
-            except (TypeError, ValueError):
-                stop_val = np.nan
-        if (
-            stop_val is not None
-            and np.isfinite(stop_val)
-            and stop_val > 0
-            and np.isfinite(entry_res)
-        ):
-            if side == -1:  # short
-                stop_line = entry_res + stop_val * es
-            elif side == 1:  # long
-                stop_line = entry_res - stop_val * es
-            else:
-                stop_line = np.nan
-
-            if np.isfinite(stop_line):
-                ax.axhline(
-                    stop_line,
-                    linestyle="-.",
-                    color="tab:purple",
-                    label="Stop band" if i == 1 else None,
-                )
-        ax.axhline(0.0, ls="--", c="red", lw=1.0, label="Zero" if i == 1 else None)
-
-        entry_marker = "^" if side == 1 else "v"
-        ax.scatter(
-            window["time"].iloc[0],
-            window["residual"].iloc[0],
-            marker=entry_marker,
-            s=60,
-            label="Entry" if i == 1 else None,
-        )
-        _scatter_exit(
-            ax,
-            window["time"].iloc[-1],
-            window["residual"].iloc[-1],
-            seg.get("exit_reason", "normal") or "normal",
-            exit_label_used,
-        )
-
-        ax.set_title(
-            f"Trade {i}: {pd.to_datetime(daily.loc[e, 'time']).date()} → {pd.to_datetime(daily.loc[x, 'time']).date()} ({'LONG' if daily.loc[e, 'entry_side']==1 else 'SHORT'})"
-        )
-        ax.set_ylabel("Residual (log)")
-        ax.grid(True)
-
-    stop_label = f"{stop_k}" if stop_k is not None else "trade-specific"
-    plt.suptitle(
-        f"{title_prefix} (k_entry={entry_k}, k_cross={exit_cross_k}, k_stop={stop_label})",
-        y=1.02,
-        fontsize=14,
-    )
-    plt.tight_layout()
-    if save_path:
-        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
-        plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
-        print(f"Saved: {save_path}")
-    else:
-        plt.show()
-    plt.close()
-
-
-def plot_trade_linear_spread_paths(
-    daily: pd.DataFrame,
-    prices_df: pd.DataFrame,
-    *,
-    max_trades: int | None = None,
-    title_prefix: str = "[Linear spread] Trade paths",
-    save_path: str | None = None,
-    dpi: int = 150,
-):
-    """
-    For each trade, plot S_t = close_1 - h_units_entry * close_2,
-    rebased to zero at entry (directly comparable across trades).
-    """
-    px = prices_df[["open_time", "close_1", "close_2"]].rename(
-        columns={"open_time": "time"}
-    )
-    d = pd.merge(daily, px, on="time", how="left").dropna(subset=["close_1", "close_2"])
-
-    segs = _trade_segments_from_daily(d)
-    if not segs:
-        print("No trades to plot.")
-        return
-    if max_trades is not None:
-        segs = segs[:max_trades]
-
-    n = len(segs)
-    cols = 3
-    rows = math.ceil(n / cols)
-    plt.figure(figsize=(6 * cols, 3.8 * rows))
-
-    for i, seg in enumerate(segs, 1):
-        e, x = seg["entry_idx"], seg["exit_idx"]
-        h_units_e = seg["entry_h_units"]
-        if h_units_e is None or np.isnan(h_units_e):
-            continue
-
-        w = d.loc[e:x].reset_index(drop=True)
-        s = w["close_1"] - h_units_e * w["close_2"]
-        s_rel = s - s.iloc[0]
-
-        ax = plt.subplot(rows, cols, i)
-        ax.plot(w["time"], s_rel, label="S_t - S_entry", lw=1.5, color="black")
-        ax.axhline(0.0, ls="--", c="gray", lw=1.0)
-        ax.scatter(
-            w["time"].iloc[0],
-            s_rel.iloc[0],
-            marker="^" if d.loc[e, "entry_side"] == 1 else "v",
-            s=60,
-            label="Entry" if i == 1 else None,
-        )
-        ax.scatter(
-            w["time"].iloc[-1],
-            s_rel.iloc[-1],
-            marker="o",
-            s=60,
-            facecolors="none",
-            edgecolors="tab:orange",
-            label="Exit" if i == 1 else None,
-        )
-
-        ax.set_title(
-            f"Trade {i}: {pd.to_datetime(d.loc[e, 'time']).date()} → {pd.to_datetime(d.loc[x, 'time']).date()} ({'LONG' if d.loc[e, 'entry_side']==1 else 'SHORT'})"
-        )
-        ax.set_ylabel("Spread (rebased)")
-        ax.grid(True)
-
-    plt.suptitle(
-        f"{title_prefix} (S_t = close_1 - h_units*close_2)", y=1.02, fontsize=14
-    )
-    plt.tight_layout()
-    if save_path:
-        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
-        plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
-        print(f"Saved: {save_path}")
-    else:
-        plt.show()
-    plt.close()
-
-
 def plot_trade_residual_spread_paths(
     daily: pd.DataFrame,
     prices_df: pd.DataFrame,
@@ -783,7 +556,6 @@ def plot_trade_residual_spread_paths(
     if save_path:
         os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
         plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
-        print(f"Saved: {save_path}")
     else:
         plt.show()
     plt.close()
@@ -885,7 +657,6 @@ def plot_beta_and_pvalue(
     if save_path:
         os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
         fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
-        print(f"Saved: {save_path}")
     else:
         plt.show()
     plt.close(fig)
@@ -900,13 +671,30 @@ def heatmap_from_pivot(
     ylabel: str = "train_len_days",
     figsize: tuple = (10, 6),
     rotate_xticks: int = 45,
-):
-    """
-    Generic heatmap for a DataFrame pivot (index x columns).
-    """
-    fig, ax = plt.subplots(figsize=figsize)
+    cmap: str = "viridis",
+    vmin: float | None = None,
+    vmax: float | None = None,
+    fmt: str = "{:.2f}",
+    annot: bool = True,
+    ax: plt.Axes | None = None,
+) -> plt.Axes:
+    """Generic heatmap for a DataFrame pivot (index x columns)."""
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
+
     data = piv.values
-    im = ax.imshow(data, origin="lower", aspect="auto")
+    if vmin is None or vmax is None:
+        finite = data[np.isfinite(data)]
+        if finite.size:
+            if vmin is None:
+                vmin = float(np.min(finite))
+            if vmax is None:
+                vmax = float(np.max(finite))
+
+    im = ax.imshow(data, origin="lower", aspect="auto", cmap=cmap, vmin=vmin, vmax=vmax)
     ax.set_xticks(np.arange(len(piv.columns)))
     ax.set_xticklabels(
         [str(c) for c in piv.columns], rotation=rotate_xticks, ha="right"
@@ -916,11 +704,16 @@ def heatmap_from_pivot(
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.set_title(title)
-    cbar = plt.colorbar(im, ax=ax)
+
+    if annot:
+        for (i, j), val in np.ndenumerate(data):
+            if np.isfinite(val):
+                ax.text(j, i, fmt.format(val), ha="center", va="center", color="white")
+
+    cbar = fig.colorbar(im, ax=ax)
     cbar.set_label(cbar_label)
-    plt.tight_layout()
-    plt.show()
-    plt.close(fig)
+    fig.tight_layout()
+    return ax
 
 
 def heatmap_from_pivot_mask_nan(
@@ -932,25 +725,31 @@ def heatmap_from_pivot_mask_nan(
     ylabel: str = "train_len_days",
     figsize: tuple = (10, 6),
     rotate_xticks: int = 45,
-):
-    """
-    Heatmap that treats NaNs as a separate color (useful for final_equity grids).
-    """
-    fig, ax = plt.subplots(figsize=figsize)
+    cmap: str = "viridis",
+    fmt: str = "{:.2f}",
+    annot: bool = True,
+    ax: plt.Axes | None = None,
+) -> plt.Axes:
+    """Heatmap variant that renders NaNs with a dedicated color."""
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
 
     data = piv.values.astype(float)
     mask = ~np.isfinite(data)
     masked = np.ma.masked_array(data, mask=mask)
 
-    cmap = plt.cm.viridis.copy()
-    cmap.set_bad(color="lightgray")
+    cmap_obj = plt.get_cmap(cmap).copy()
+    cmap_obj.set_bad(color="lightgray")
 
-    finite_vals = data[np.isfinite(data)]
-    vmin = np.min(finite_vals) if finite_vals.size else None
-    vmax = np.max(finite_vals) if finite_vals.size else None
+    finite = data[np.isfinite(data)]
+    vmin = float(np.min(finite)) if finite.size else None
+    vmax = float(np.max(finite)) if finite.size else None
 
     im = ax.imshow(
-        masked, origin="lower", aspect="auto", cmap=cmap, vmin=vmin, vmax=vmax
+        masked, origin="lower", aspect="auto", cmap=cmap_obj, vmin=vmin, vmax=vmax
     )
     ax.set_xticks(np.arange(len(piv.columns)))
     ax.set_xticklabels(
@@ -961,8 +760,132 @@ def heatmap_from_pivot_mask_nan(
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.set_title(title)
-    cbar = plt.colorbar(im, ax=ax)
+
+    if annot:
+        for (i, j), val in np.ndenumerate(data):
+            if np.isfinite(val):
+                ax.text(j, i, fmt.format(val), ha="center", va="center", color="white")
+
+    cbar = fig.colorbar(im, ax=ax)
     cbar.set_label(cbar_label)
-    plt.tight_layout()
-    plt.show()
-    plt.close(fig)
+    fig.tight_layout()
+    return ax
+
+
+def heatmap_from_results(
+    results: pd.DataFrame,
+    *,
+    metric_col: str = "sharpe",
+    title: str | None = None,
+    cbar_label: str | None = None,
+    annot: bool = True,
+    fmt: str = "{:+.2f}",
+    mask_nan: bool = True,
+    xlabel: str = "entry_k",
+    ylabel: str = "train_len_days",
+    cmap: str = "viridis",
+    ax: plt.Axes | None = None,
+) -> plt.Axes:
+    """Plot a heatmap for a metric contained in results_df (train_len_days x entry_k)."""
+
+    required = {"train_len_days", "entry_k", metric_col}
+    missing = required - set(results.columns)
+    if missing:
+        raise ValueError(f"results is missing columns: {sorted(missing)}")
+
+    pivot = results.pivot(index="train_len_days", columns="entry_k", values=metric_col)
+
+    title = title or f"{metric_col} heatmap"
+    cbar = cbar_label or metric_col
+
+    if mask_nan:
+        return heatmap_from_pivot_mask_nan(
+            pivot,
+            title=title,
+            cbar_label=cbar,
+            xlabel=xlabel,
+            ylabel=ylabel,
+            annot=annot,
+            fmt=fmt,
+            cmap=cmap,
+            ax=ax,
+        )
+
+    return heatmap_from_pivot(
+        pivot,
+        title=title,
+        cbar_label=cbar,
+        xlabel=xlabel,
+        ylabel=ylabel,
+        annot=annot,
+        fmt=fmt,
+        cmap=cmap,
+        ax=ax,
+    )
+
+
+def heatmap_success_rate(
+    results: pd.DataFrame,
+    *,
+    metric_col: str = "normal_exit_pct",
+    title: str = "Success rate heatmap",
+    cbar_label: str = "Success rate",
+    fmt: str = "{:.0%}",
+    **kwargs,
+) -> plt.Axes:
+    """Plot success-rate (normal exits / total trades) heatmap for results_df."""
+
+    return heatmap_from_results(
+        results,
+        metric_col=metric_col,
+        title=title,
+        cbar_label=cbar_label,
+        fmt=fmt,
+        **kwargs,
+    )
+
+
+def heatmap_entry_count(
+    results: pd.DataFrame,
+    *,
+    metric_col: str = "entry_count",
+    title: str = "Entry count heatmap",
+    cbar_label: str = "Entries",
+    fmt: str = "{:.0f}",
+    mask_nan: bool = False,
+    **kwargs,
+) -> plt.Axes:
+    """Plot number-of-entries heatmap for results_df."""
+
+    return heatmap_from_results(
+        results,
+        metric_col=metric_col,
+        title=title,
+        cbar_label=cbar_label,
+        fmt=fmt,
+        mask_nan=mask_nan,
+        **kwargs,
+    )
+
+
+def heatmap_final_equity(
+    results: pd.DataFrame,
+    *,
+    metric_col: str = "final_equity",
+    title: str = "Final equity heatmap",
+    cbar_label: str = "Final equity",
+    fmt: str = "{:.0f}",
+    mask_nan: bool = True,
+    **kwargs,
+) -> plt.Axes:
+    """Plot final equity heatmap for results_df."""
+
+    return heatmap_from_results(
+        results,
+        metric_col=metric_col,
+        title=title,
+        cbar_label=cbar_label,
+        fmt=fmt,
+        mask_nan=mask_nan,
+        **kwargs,
+    )

@@ -1,6 +1,6 @@
 #
 # File Name: fetch_data.py
-# Modified Time: 2025-10-07 04:34:48
+# Modified Time: 2025-10-07 08:21:56
 #
 
 
@@ -363,7 +363,7 @@ if __name__ == "__main__":
     default_quotes = ["USDT"]
     default_data_types = ["futures"]
     default_begin = "2022-08"
-    default_end = "2025-08"
+    default_end = "2025-09"
     default_interval = "1h"
     default_save = "data"
 
