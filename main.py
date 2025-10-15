@@ -30,7 +30,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 DATA_DIR = Path("/home/jim/CryptoPairTrading/data/futures")
 DATA_ROOT = DATA_DIR.parent
 PAIR_CSV = Path("/home/jim/CryptoPairTrading/export_after_signal_test.csv")
-OUTPUT_DIR = Path("figures/portfolio_runs")
+OUTPUT_DIR = Path("runs/portfolio")
 
 TRAIN_START = pd.Timestamp("2023-01-01")
 TRAIN_END = pd.Timestamp("2024-12-31")
@@ -47,7 +47,7 @@ DEACTIVATE_EQUITY_RATIO = 0.50
 DEFAULT_BACKTEST_KWARGS = dict(
     require_cointegration=True,
     reset_len=RESET_LEN,
-    pval_alpha=0.10,
+    pval_alpha=0.05,
     exit_k=0.5,
     relaxed_pval_alpha=0.20,
     stop_loss_pct=0.20,
@@ -220,8 +220,14 @@ def main(
     top_n: int = 100,
     max_workers: Optional[int] = None,
     mp_context: Optional[mp.context.BaseContext] = None,
+    run_tag: str | None = None,
 ) -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir = OUTPUT_DIR
+    if run_tag:
+        safe_tag = str(run_tag).strip().replace(" ", "_")
+        if safe_tag:
+            output_dir = OUTPUT_DIR.parent / f"{OUTPUT_DIR.name}_{safe_tag}"
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     mp_ctx = mp_context or mp.get_context("fork")
 
@@ -235,7 +241,9 @@ def main(
         f"  Train lengths: {GRID_TRAIN_LEN}\n"
         f"  Entry k grid : {GRID_ENTRY_K}\n"
         f"  Exit k grid  : {GRID_EXIT_K}\n"
-        f"  Deactivate at: {DEACTIVATE_EQUITY_RATIO:.0%} of initial equity"
+        f"  Deactivate at: {DEACTIVATE_EQUITY_RATIO:.0%} of initial equity\n"
+        f"  CPU workers : {max_workers if max_workers is not None else os.cpu_count()}\n"
+        f"  Output dir  : {output_dir}"
     )
     print(config_msg)
     logger.info(config_msg)
@@ -302,7 +310,7 @@ def main(
 
     train_tables = {name: summary.table for name, summary in train_results.items()}
     for name, table in train_tables.items():
-        path = OUTPUT_DIR / f"{name}_train_summary.csv"
+        path = output_dir / f"{name}_train_summary.csv"
         table.to_csv(path, index=False)
         logger.info("Saved training summary for %s to %s", name, path)
 
@@ -322,7 +330,7 @@ def main(
             best_plot_bar.update(1)
             continue
 
-        combo_dir = OUTPUT_DIR / name / "train"
+        combo_dir = output_dir / name / "train"
         combo_dir.mkdir(parents=True, exist_ok=True)
 
         title_base = (
@@ -363,7 +371,7 @@ def main(
     best_plot_bar.close()
 
     for name, result in test_results.items():
-        pair_dir = OUTPUT_DIR / name
+        pair_dir = output_dir / name
         pair_dir.mkdir(parents=True, exist_ok=True)
 
         daily = result.test_daily
@@ -410,11 +418,11 @@ def main(
             logger.info("Saved test metrics for %s to %s", name, metrics_path)
 
     if not equity_curve.empty:
-        port_path = OUTPUT_DIR / "portfolio_equity.csv"
+        port_path = output_dir / "portfolio_equity.csv"
         equity_curve.to_csv(port_path, index=False)
         logger.info("Saved portfolio equity curve to %s", port_path)
 
-        equity_plot_path = OUTPUT_DIR / "portfolio_equity.png"
+        equity_plot_path = output_dir / "portfolio_equity.png"
         plot_portfolio_equity(equity_curve, str(equity_plot_path))
         logger.info("Saved portfolio equity plot to %s", equity_plot_path)
     else:
@@ -424,6 +432,10 @@ def main(
 
 
 if __name__ == "__main__":
+    RUN_TAG = "coint"  # e.g. "no_coint_run"
+    TOP_N = 100
+    MAX_WORKERS = os.cpu_count() - 5
+
     logging.basicConfig(
         filename="backtest.log",
         filemode="w",
@@ -432,4 +444,9 @@ if __name__ == "__main__":
         force=True,
     )
     mp_ctx = mp.get_context("fork")
-    main(top_n=30, max_workers=os.cpu_count() - 5, mp_context=mp_ctx)
+    main(
+        top_n=TOP_N,
+        max_workers=MAX_WORKERS,
+        mp_context=mp_ctx,
+        run_tag=RUN_TAG,
+    )

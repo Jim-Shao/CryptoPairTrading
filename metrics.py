@@ -32,7 +32,7 @@ def _total_return(first_value: float, last_value: float) -> float:
 def _ann_return(first_value: float, last_value: float, times: pd.Series) -> float:
     t = pd.to_datetime(times)
     years = max((t.iloc[-1] - t.iloc[0]).days / 365.25, 1e-9)
-    if first_value <= 0:
+    if first_value <= 0 or last_value <= 0:
         return np.nan
     return (last_value / first_value) ** (1.0 / years) - 1.0
 

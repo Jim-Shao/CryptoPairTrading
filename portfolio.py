@@ -96,6 +96,37 @@ def _train_single_pair(
     return spec.name, summary
 
 
+def _test_single_pair(
+    spec: PairSpec,
+    best_params: dict[str, Any] | None,
+    allocation: float,
+) -> tuple[str, pd.DataFrame | None, pd.DataFrame | None, dict[str, Any] | None]:
+    if not best_params:
+        return spec.name, None, None, None
+
+    bt_kwargs = dict(spec.backtester_kwargs)
+    bt_kwargs.update(best_params)
+    bt_kwargs.setdefault("trade_frac", 1.0)
+    bt_kwargs.setdefault("initial_balance", allocation)
+
+    train_len_hours = int(best_params.get("train_len", 0))
+    combo_start = spec.test_window[0] - pd.to_timedelta(train_len_hours, unit="h")
+    earliest = pd.to_datetime(spec.exchange.time_index().min())
+    if combo_start < earliest:
+        combo_start = earliest
+
+    bt = CointBacktester(
+        exchange=spec.exchange,
+        start_time=combo_start,
+        end_time=spec.test_window[1],
+        **bt_kwargs,
+    )
+    daily, fits = bt.run()
+    metric_kwargs = spec.metrics_kwargs or {}
+    metrics, _ = summarize_performance(daily, **metric_kwargs)
+    return spec.name, daily, fits, metrics
+
+
 class Portfolio:
     """
     Coordinate training parameter search and test-period backtests across multiple pairs.
@@ -223,65 +254,66 @@ class Portfolio:
         runs: Dict[str, PairRunResult] = {}
         allocation = self.allocation_per_pair
 
-        for spec in self.pairs:
-            summary = self._train_results.get(spec.name)
-            if summary is None:
-                raise RuntimeError(f"No training result stored for pair '{spec.name}'.")
+        spec_map = {spec.name: spec for spec in self.pairs}
 
-            best_params = summary.best_params or {}
-            if not best_params:
-                logger.warning(
-                    "Skipping test run for %s (no valid training results).",
-                    spec.name,
-                )
-                runs[spec.name] = PairRunResult(
+        if self.max_workers is None or self.max_workers <= 1:
+            for spec in self.pairs:
+                summary = self._train_results.get(spec.name)
+                if summary is None:
+                    raise RuntimeError(f"No training result stored for pair '{spec.name}'.")
+                logger.info("Testing pair %s with params %s...", spec.name, summary.best_params)
+                name, daily, fits, metrics = _test_single_pair(spec, summary.best_params, allocation)
+                if daily is None:
+                    logger.warning("Skipping test run for %s (no valid training results).", spec.name)
+                runs[name] = PairRunResult(
                     pair=spec,
                     train_summary=summary,
-                    test_daily=None,
-                    test_fits=None,
-                    test_metrics=None,
+                    test_daily=daily,
+                    test_fits=fits,
+                    test_metrics=metrics,
                 )
-                continue
+                final_equity = (
+                    float(daily["pnl"].iloc[-1]) if daily is not None and not daily.empty else float("nan")
+                )
+                logger.info(
+                    "Completed test for %s | Sharpe=%s | FinalEquity=%.2f",
+                    spec.name,
+                    metrics.get("Sharpe") if metrics else "n/a",
+                    final_equity,
+                )
+        else:
+            ctx = self.mp_context or mp.get_context()
+            with ProcessPoolExecutor(max_workers=self.max_workers, mp_context=ctx) as executor:
+                futures = {}
+                for spec in self.pairs:
+                    summary = self._train_results.get(spec.name)
+                    if summary is None:
+                        raise RuntimeError(f"No training result stored for pair '{spec.name}'.")
+                    futures[executor.submit(_test_single_pair, spec, summary.best_params, allocation)] = spec.name
 
-            logger.info("Testing pair %s with params %s...", spec.name, best_params)
-            bt_kwargs = dict(spec.backtester_kwargs)
-            bt_kwargs.update(best_params)
-            bt_kwargs.setdefault("trade_frac", 1.0)
-            bt_kwargs.setdefault("initial_balance", allocation)
-
-            combo_start = spec.train_window[0] - pd.to_timedelta(
-                best_params.get("train_len", 0), unit="h"
-            )
-            earliest = pd.to_datetime(spec.exchange.time_index().min())
-            if combo_start < earliest:
-                combo_start = earliest
-
-            bt = CointBacktester(
-                exchange=spec.exchange,
-                start_time=combo_start,
-                end_time=spec.test_window[1],
-                **bt_kwargs,
-            )
-            daily, fits = bt.run()
-            mk = spec.metrics_kwargs or {}
-            metrics, _ = summarize_performance(daily, **mk)
-
-            runs[spec.name] = PairRunResult(
-                pair=spec,
-                train_summary=summary,
-                test_daily=daily,
-                test_fits=fits,
-                test_metrics=metrics,
-            )
-            final_equity = (
-                float(daily["pnl"].iloc[-1]) if daily is not None and not daily.empty else float("nan")
-            )
-            logger.info(
-                "Completed test for %s | Sharpe=%s | FinalEquity=%.2f",
-                spec.name,
-                metrics.get("Sharpe") if metrics else "n/a",
-                final_equity,
-            )
+                for fut in as_completed(futures):
+                    name = futures[fut]
+                    summary = self._train_results[name]
+                    spec = spec_map[name]
+                    name_res, daily, fits, metrics = fut.result()
+                    if daily is None:
+                        logger.warning("Skipping test run for %s (no valid training results).", name_res)
+                    runs[name_res] = PairRunResult(
+                        pair=spec,
+                        train_summary=summary,
+                        test_daily=daily,
+                        test_fits=fits,
+                        test_metrics=metrics,
+                    )
+                    final_equity = (
+                        float(daily["pnl"].iloc[-1]) if daily is not None and not daily.empty else float("nan")
+                    )
+                    logger.info(
+                        "Completed test for %s | Sharpe=%s | FinalEquity=%.2f",
+                        name_res,
+                        metrics.get("Sharpe") if metrics else "n/a",
+                        final_equity,
+                    )
 
         self._pair_runs = runs
         return runs
@@ -291,22 +323,20 @@ class Portfolio:
         Combine per-pair daily curves by aligning on timestamp and summing metrics.
 
         Missing values are forward-filled within each pair before aggregation.
-        Returns a DataFrame with columns time, portfolio_equity, portfolio_cash,
-        portfolio_margin_used, portfolio_fees (cumulative).
+        Returns a DataFrame with columns time, portfolio_equity,
+        portfolio_fees, portfolio_active.
         """
         if not self._pair_runs:
             raise RuntimeError("No pair runs available. Call run_test() first.")
 
         metrics_map = {
             "pnl": "equity",
-            "cash": "cash",
-            "margin_used": "margin_used",
             "fees_cumulative": "fees",
             "position": "active",
         }
 
-        frames: list[pd.DataFrame] = []
-        for name, result in self._pair_runs.items():
+        long_frames: list[pd.DataFrame] = []
+        for result in self._pair_runs.values():
             daily = result.test_daily
             if daily is None or daily.empty:
                 continue
@@ -315,54 +345,56 @@ class Portfolio:
                 continue
             df = daily[["time", *use_cols]].copy()
             df["time"] = pd.to_datetime(df["time"])
+            df = df.sort_values("time").reset_index(drop=True)
             for col in use_cols:
                 series = pd.to_numeric(df[col], errors="coerce")
                 if col == "position":
                     series = series.abs().clip(upper=1.0)
                     series = series.where(series == 0, 1.0)
-                df[f"{name}_{metrics_map[col]}"] = series
-            cols_to_keep = ["time", *[f"{name}_{metrics_map[c]}" for c in use_cols]]
-            frames.append(df[cols_to_keep])
+                df[col] = series
+            df[use_cols] = df[use_cols].ffill()
+            melted = df.melt(
+                id_vars="time",
+                value_vars=use_cols,
+                var_name="metric",
+                value_name="value",
+            )
+            melted["metric"] = melted["metric"].map(metrics_map)
+            long_frames.append(melted)
 
-        if not frames:
+        if not long_frames:
             return pd.DataFrame(
-                columns=[
-                    "time",
-                    "portfolio_equity",
-                    "portfolio_cash",
-                    "portfolio_margin_used",
-                    "portfolio_fees",
-                ]
+                columns=["time", "portfolio_equity", "portfolio_fees", "portfolio_active"]
             )
 
-        merged = frames[0]
-        for df in frames[1:]:
-            merged = pd.merge(merged, df, on="time", how="outer")
+        agg = pd.concat(long_frames, ignore_index=True)
+        agg = agg.groupby(["time", "metric"], sort=True)["value"].sum().unstack("metric")
+        agg = agg.sort_index().reset_index()
 
-        merged = merged.sort_values("time").reset_index(drop=True)
-        metric_suffixes = {"equity", "cash", "margin_used", "fees", "active"}
-        for suffix in metric_suffixes:
-            cols = [c for c in merged.columns if c.endswith(f"_{suffix}")]
-            if cols:
-                merged[cols] = merged[cols].ffill()
-                merged[f"portfolio_{suffix}"] = merged[cols].sum(axis=1, min_count=1)
+        test_start = max(spec.test_window[0] for spec in self.pairs)
+        agg = agg[agg["time"] >= pd.to_datetime(test_start)].reset_index(drop=True)
 
-        active_count_col = "portfolio_active"
-        if active_count_col in merged.columns:
-            merged[active_count_col] = merged[active_count_col].fillna(0.0)
-            merged["portfolio_active_ratio"] = merged[active_count_col] / max(len(self.pairs), 1)
+        agg.rename(
+            columns={
+                "equity": "portfolio_equity",
+                "fees": "portfolio_fees",
+                "active": "portfolio_active",
+            },
+            inplace=True,
+        )
 
-        keep_cols = [
-            "time",
-            "portfolio_equity",
-            "portfolio_fees",
-            "portfolio_active",
-            "portfolio_active_ratio",
-        ]
-        for col in keep_cols:
-            if col not in merged.columns:
-                merged[col] = float("nan")
-        return merged[keep_cols]
+        numeric_cols = [c for c in ["portfolio_equity", "portfolio_fees", "portfolio_active"] if c in agg.columns]
+        agg[numeric_cols] = agg[numeric_cols].fillna(method="ffill")
+        if "portfolio_fees" in agg.columns:
+            agg["portfolio_fees"] = agg["portfolio_fees"].fillna(0.0)
+        if "portfolio_active" in agg.columns:
+            agg["portfolio_active"] = agg["portfolio_active"].fillna(0.0)
+
+        for col in ["portfolio_equity", "portfolio_fees", "portfolio_active"]:
+            if col not in agg.columns:
+                agg[col] = float("nan")
+
+        return agg[["time", "portfolio_equity", "portfolio_fees", "portfolio_active"]]
 
     @property
     def pair_runs(self) -> Dict[str, PairRunResult]:
