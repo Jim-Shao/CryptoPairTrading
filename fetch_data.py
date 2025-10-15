@@ -1,9 +1,3 @@
-#
-# File Name: fetch_data.py
-# Modified Time: 2025-10-07 08:21:56
-#
-
-
 """
 Binance historical klines downloader (Python version of your Bash script).
 
@@ -348,18 +342,18 @@ def get_pairs_spot(quote: str = "USDT") -> List[str]:
 
 if __name__ == "__main__":
     # Defaults that mirror your Bash script; can be overridden via CLI.
-    default_cryptos = [
-        "DOGE",
-        "DOT",
-        "OP",
-        "MINA",
-        "C98",
-        "1INCH",
-        "CELO",
-        "KSM",
-        "BAND",
-    ]
-    # default_cryptos = get_pairs_spot("USDT")
+    # default_cryptos = [
+    #     "DOGE",
+    #     "DOT",
+    #     "OP",
+    #     "MINA",
+    #     "C98",
+    #     "1INCH",
+    #     "CELO",
+    #     "KSM",
+    #     "BAND",
+    # ]
+    default_cryptos = get_pairs_spot("USDT")
     default_quotes = ["USDT"]
     default_data_types = ["futures"]
     default_begin = "2022-08"
@@ -367,33 +361,34 @@ if __name__ == "__main__":
     default_interval = "1h"
     default_save = "data"
 
-    if len(sys.argv) == 1:
-        # No CLI arguments provided -> run with defaults similar to your Bash script
-        run(
-            cryptocurrencies=default_cryptos,
-            quote_currencies=default_quotes,
-            data_types=default_data_types,
-            begin=default_begin,
-            end=default_end,
-            interval=default_interval,
-            save_root=default_save,
-            threads=64,  # set >1 to enable multithreading
-            proxy=None,  # or e.g. "http://127.0.0.1:61017"
-            timeout=30,
-            retries=3,
-        )
-    else:
-        args = parse_args(sys.argv[1:])
-        run(
-            cryptocurrencies=args.cryptos,
-            quote_currencies=args.quotes,
-            data_types=args.data_types,
-            begin=args.begin,
-            end=args.end,
-            interval=args.interval,
-            save_root=args.save,
-            threads=args.threads,
-            proxy=args.proxy,
-            timeout=args.timeout,
-            retries=args.retries,
-        )
+    if __name__ == "__main__":
+        if len(sys.argv) == 1:
+            # No CLI arguments provided -> run with defaults similar to your Bash script
+            run(
+                cryptocurrencies=default_cryptos,
+                quote_currencies=default_quotes,
+                data_types=default_data_types,
+                begin=default_begin,
+                end=default_end,
+                interval=default_interval,
+                save_root=default_save,
+                threads=64,  # set >1 to enable multithreading
+                proxy=None,  # or e.g. "http://127.0.0.1:61017"
+                timeout=30,
+                retries=3,
+            )
+        else:
+            args = parse_args(sys.argv[1:])
+            run(
+                cryptocurrencies=args.cryptos,
+                quote_currencies=args.quotes,
+                data_types=args.data_types,
+                begin=args.begin,
+                end=args.end,
+                interval=args.interval,
+                save_root=args.save,
+                threads=args.threads,
+                proxy=args.proxy,
+                timeout=args.timeout,
+                retries=args.retries,
+            )

@@ -1,9 +1,3 @@
-#
-# File Name: utils.py
-# Modified Time: 2025-10-07 04:34:09
-#
-
-
 import os
 import numpy as np
 import pandas as pd
@@ -97,11 +91,23 @@ def adf_pvalue(series: pd.Series) -> float:
 
 def fit_coint(train: pd.DataFrame, coint_var: str) -> dict:
     """OLS y = beta0 + beta1 * x, return params, residual sigma, and ADF p-value."""
-    y = train[f"{coint_var}_1"]
-    X = sm.add_constant(train[f"{coint_var}_2"])
+    y = train[f"{coint_var}_1"].astype(float)
+    x_name = f"{coint_var}_2"
+    x = train[x_name].astype(float).to_frame(name=x_name)
+    X = sm.add_constant(x, has_constant="add")
     model = sm.OLS(y, X).fit()
-    beta0 = float(model.params["const"])
-    beta1 = float(model.params[f"{coint_var}_2"])
+
+    params = model.params
+    if hasattr(params, "index"):
+        beta0 = float(params.get("const", params.iloc[0]))
+        beta1 = float(params.get(x_name, params.iloc[-1]))
+    else:
+        params_arr = np.asarray(params).flatten()
+        if params_arr.size < 2:
+            raise ValueError("OLS returned insufficient parameters")
+        beta0 = float(params_arr[0])
+        beta1 = float(params_arr[1])
+
     resid = y - model.predict(X)
     sigma = float(resid.std())
     pval = adf_pvalue(resid)

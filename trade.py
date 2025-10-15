@@ -1,8 +1,4 @@
-#
-# File Name: trade.py
-# Modified Time: 2025-10-07 04:34:01
-#
-
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -69,14 +65,19 @@ class CointRegime:
         self.valid_to = None  # inclusive index until which this regime is valid
 
     def fit_from_window(
-        self, train: pd.DataFrame, coint_var: str, pval_alpha: float
+        self,
+        train: pd.DataFrame,
+        coint_var: str,
+        pval_alpha: float,
+        *,
+        force_active: bool = False,
     ) -> None:
         fit = fit_coint(train, coint_var)
         self.beta0 = fit["beta0"]
         self.beta1 = fit["beta1"]
         self.sigma = fit["sigma"]
         self.p_value = fit["p_value"]
-        self.active = bool(self.p_value < pval_alpha)
+        self.active = force_active or bool(self.p_value < pval_alpha)
 
     def residual(self, y_val: float, x_val: float) -> float | None:
         if self.beta0 is None or self.beta1 is None:
@@ -84,7 +85,7 @@ class CointRegime:
         return residual_on_row(self.beta0, self.beta1, y_val, x_val)
 
 
-class Account:
+class Position:
     """
     Tracks position state, margin-capped sizing (single margin rate), MTM, and equity.
 
@@ -102,6 +103,7 @@ class Account:
         margin_rate: float = 0.10,
         fee_rate: float = 0.0,
     ):
+        self.initial_balance = float(initial_balance)
         self.cash = float(initial_balance)
         self.trade_frac = float(trade_frac)
         self.m = float(
@@ -130,6 +132,9 @@ class Account:
         # optional bookkeeping
         self.entry_gross = 0.0
         self.entry_margin = 0.0
+        self.entry_equity = None  # equity snapshot right after entry
+        self.min_equity_ratio: float | None = None
+        self.deactivated = False
 
     @staticmethod
     def _units_ratio(beta1_log: float, p1: float, p2: float) -> float:
@@ -137,7 +142,7 @@ class Account:
         return float(beta1_log) * float(p1) / max(float(p2), 1e-9)
 
     def can_enter(self) -> bool:
-        return self.state == "flat"
+        return self.state == "flat" and not self.deactivated
 
     def _size_by_margin(
         self, p1: float, p2: float, h_units: float
@@ -186,6 +191,7 @@ class Account:
         self.cash -= total_fee
         self.cumulative_fees += total_fee
         self.last_entry_fee = total_fee
+        self.entry_equity = self.mark_to_market(y_price, x_price)
         return total_fee
 
     def open_short(
@@ -221,7 +227,17 @@ class Account:
         self.cash -= total_fee
         self.cumulative_fees += total_fee
         self.last_entry_fee = total_fee
+        self.entry_equity = self.mark_to_market(y_price, x_price)
         return total_fee
+
+    def set_min_equity_ratio(self, ratio: float | None) -> None:
+        self.min_equity_ratio = float(ratio) if ratio is not None else None
+
+    def enforce_deactivation(self, current_equity: float) -> None:
+        if self.min_equity_ratio is None or self.deactivated:
+            return
+        if current_equity <= self.initial_balance * self.min_equity_ratio:
+            self.deactivated = True
 
     def mark_to_market(self, y_price: float, x_price: float) -> float:
         """Cash + unrealized PnL using fixed quantities."""
@@ -254,22 +270,25 @@ class Account:
             # cross downward through +level
             return (prev_resid > level) and (curr_resid <= level)
 
-    # Stop-loss: residual moves stop_k * sigma further against the entry residual
-    def should_stop_loss(self, curr_resid: float | None, stop_k: float) -> bool:
+    # Stop-loss: trigger when mark-to-market drawdown exceeds threshold of entry equity
+    def should_stop_loss(
+        self, equity_now: float | None, stop_loss_pct: float | None
+    ) -> bool:
         if (
             self.state == "flat"
-            or self.entry_sigma is None
-            or self.entry_residual is None
-            or curr_resid is None
+            or stop_loss_pct is None
+            or stop_loss_pct <= 0
+            or self.entry_equity is None
+            or equity_now is None
+            or not np.isfinite(equity_now)
         ):
             return False
-        delta = stop_k * self.entry_sigma
-        if self.state == "long":
-            # long: entry residual is negative; more negative than entry by delta -> stop
-            return curr_resid <= (self.entry_residual - delta)
-        else:
-            # short: entry residual is positive; more positive than entry by delta -> stop
-            return curr_resid >= (self.entry_residual + delta)
+        if not np.isfinite(self.entry_equity) or self.entry_equity <= 0:
+            return False
+        loss = self.entry_equity - equity_now
+        if loss <= 0:
+            return False
+        return (loss / self.entry_equity) >= stop_loss_pct
 
     def close_position(
         self,
@@ -295,6 +314,7 @@ class Account:
         self.qty_x = 0.0
         self.entry_gross = 0.0
         self.entry_margin = 0.0
+        self.entry_equity = None
         return total_fee
 
 
@@ -302,15 +322,16 @@ class CointBacktester:
     """
     Event-driven, OOP-style backtester with:
       - Exchange for bar streaming
-      - Cointegration decision every 'gap' bars when flat
-      - Account to track positions and equity
+      - Cointegration decision every 'reset_len' bars when flat
+      - Position to track positions and equity
+      - Optional regression-only mode (require_cointegration=False) that ignores ADF gating
 
     New:
       - On each reset day, re-check cointegration with the current fixed beta over the last train_len bars.
         * If flat: use strict pval_alpha; if it fails, switch to a newly refit beta immediately.
         * If in position: use relaxed_pval_alpha; if it fails, force close the position, then refit/switch beta.
-      - Stop-loss stop_k that triggers when residual drifts stop_k * sigma further against the entry residual
-        (higher priority than the crossing exit).
+      - Stop-loss defined on mark-to-market drawdown of entry equity (higher priority than the crossing exit).
+      - These re-checks are skipped when require_cointegration is False.
     """
 
     def __init__(
@@ -321,18 +342,23 @@ class CointBacktester:
         *,
         coint_var: str = "log_close",
         train_len: int,
-        gap: int,
+        reset_len: int,
+        require_cointegration: bool = True,
         pval_alpha: float = 0.05,
         entry_k: float = 2.0,
         exit_k: float = 0.5,
         # New:
         relaxed_pval_alpha: float = 0.10,  # looser threshold while holding
-        stop_k: float = 3.0,  # stop-loss multiple relative to entry_sigma
+        stop_loss_pct: (
+            float | None
+        ) = None,  # stop when equity drawdown exceeds this fraction
+        stop_k: float | None = None,  # deprecated name kept for backward compatibility
         stop_loss_cooling_days: float = 0.0,  # cooling period after stop loss
         initial_balance: float = 1_000_000.0,
         trade_frac: float = 0.10,
         margin_rate: float = 0.10,
         fee_rate: float = 0.0,
+        deactivate_equity_ratio: float | None = None,
     ):
         self.ex = exchange
         times = self.ex.time_index()
@@ -345,30 +371,54 @@ class CointBacktester:
         self.end_idx = int(self.idx_map[-1])
 
         self.train_len = int(train_len)
-        self.gap = int(gap)
+        self.reset_len = int(reset_len)
         self.coint_var = coint_var
+        self.require_cointegration = bool(require_cointegration)
         self.pval_alpha = float(pval_alpha)
         self.entry_k = float(entry_k)
         self.exit_k = float(exit_k)
         # New:
         self.relaxed_pval_alpha = float(relaxed_pval_alpha)
-        self.stop_k = float(stop_k)
+        if stop_loss_pct is not None and stop_k is not None:
+            raise ValueError("Specify only one of stop_loss_pct or stop_k.")
+        if stop_loss_pct is None and stop_k is None:
+            stop_loss_pct = 0.20
+        if stop_loss_pct is None and stop_k is not None:
+            warnings.warn(
+                "`stop_k` is deprecated; interpret its value as stop_loss_pct (fractional drawdown). "
+                "Update your call to use stop_loss_pct=...",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            stop_loss_pct = stop_k
+        self.stop_loss_pct = float(stop_loss_pct) if stop_loss_pct is not None else None
+        if self.stop_loss_pct is not None and self.stop_loss_pct < 0:
+            raise ValueError("stop_loss_pct must be non-negative.")
+        self.stop_k = (
+            self.stop_loss_pct
+        )  # backward compatibility for existing notebooks
         self.stop_loss_cooling_days = float(stop_loss_cooling_days)
         self.stop_loss_cooling = (
             pd.Timedelta(days=self.stop_loss_cooling_days)
             if self.stop_loss_cooling_days > 0
             else None
         )
+        self.deactivate_equity_ratio = (
+            float(deactivate_equity_ratio)
+            if deactivate_equity_ratio is not None
+            else None
+        )
 
         # prevent rapid re-entry after a stop-loss
         self.cooldown_until_time: pd.Timestamp | None = None
 
-        self.account = Account(
+        self.position = Position(
             initial_balance=initial_balance,
             trade_frac=trade_frac,
             margin_rate=margin_rate,
             fee_rate=fee_rate,
         )
+        self.position.set_min_equity_ratio(self.deactivate_equity_ratio)
         self.regime = CointRegime()
 
         # logs
@@ -378,7 +428,7 @@ class CointBacktester:
     def _is_decision_day(self, bar_idx: int, first_decision_idx: int) -> bool:
         if bar_idx < first_decision_idx:
             return False
-        return ((bar_idx - first_decision_idx) % self.gap) == 0
+        return ((bar_idx - first_decision_idx) % self.reset_len) == 0
 
     # Fixed-beta cointegration re-check using the latest regime beta
     def _pvalue_with_fixed_beta(
@@ -420,7 +470,7 @@ class CointBacktester:
         if first_decision_idx > self.end_idx:
             raise ValueError("Not enough data for the first decision day.")
 
-        # regime validity window: [d, d+gap-1] after each fit at day d
+        # regime validity window: [d, d+reset_len-1] after each fit at day d
         regime_valid_to = None  # inclusive bar index
         prev_residual = None  # for crossing exit logic
         # ensure clean start if run() is called multiple times on same instance
@@ -466,13 +516,15 @@ class CointBacktester:
             # 2) on reset day, re-check cointegration with fixed beta over the last train_len bars
             #    - flat: strict threshold pval_alpha; if fail -> switch beta (refit now)
             #    - in position: relaxed threshold; if fail -> force close, then switch beta (refit now)
-            if self._is_decision_day(bar_idx, first_decision_idx) and (
-                self.regime.beta0 is not None and self.regime.beta1 is not None
+            if (
+                self.require_cointegration
+                and self._is_decision_day(bar_idx, first_decision_idx)
+                and (self.regime.beta0 is not None and self.regime.beta1 is not None)
             ):
                 fixed_beta_check_done = True
                 thr = (
                     self.relaxed_pval_alpha
-                    if self.account.state != "flat"
+                    if self.position.state != "flat"
                     else self.pval_alpha
                 )
                 fixed_beta_threshold_used = thr
@@ -493,13 +545,15 @@ class CointBacktester:
 
             # 3) if fixed-beta check fails and we are holding a position, force close first
             force_close_reason = None
-            equity_view = self.account.mark_to_market(y_close, x_close)
-            if fixed_beta_failed and self.account.state != "flat":
-                exit_fee_today += self.account.close_position(
+            equity_view = self.position.mark_to_market(y_close, x_close)
+            self.position.enforce_deactivation(equity_view)
+            if fixed_beta_failed and self.position.state != "flat":
+                exit_fee_today += self.position.close_position(
                     y_close,
                     x_close,
                 )
-                equity_view = self.account.cash
+                equity_view = self.position.cash
+                self.position.enforce_deactivation(equity_view)
                 force_close_reason = "no_longer_coint"
                 exit_flag = True
 
@@ -507,12 +561,17 @@ class CointBacktester:
             regime_switched = False
             if fixed_beta_failed:
                 train = self.ex.window(bar_idx, self.train_len)
-                self.regime.fit_from_window(train, self.coint_var, self.pval_alpha)
+                self.regime.fit_from_window(
+                    train,
+                    self.coint_var,
+                    self.pval_alpha,
+                    force_active=not self.require_cointegration,
+                )
                 p_value_today = self.regime.p_value
                 beta1_today = self.regime.beta1
                 sigma_today = self.regime.sigma
                 residual_today = self.regime.residual(y_val, x_val)
-                regime_valid_to = min(bar_idx + self.gap - 1, self.end_idx)
+                regime_valid_to = min(bar_idx + self.reset_len - 1, self.end_idx)
                 self.regime.valid_from = bar_idx
                 self.regime.valid_to = regime_valid_to
                 regime_switched = True
@@ -540,18 +599,15 @@ class CointBacktester:
                 )
 
             # 5) during a position, exit priority: stop-loss first, then crossing-based exit
-            if (
-                not exit_flag
-                and self.account.state != "flat"
-                and residual_today is not None
-            ):
+            if not exit_flag and self.position.state != "flat":
                 # (a) stop-loss
-                if self.account.should_stop_loss(residual_today, self.stop_k):
-                    exit_fee_today += self.account.close_position(
+                if self.position.should_stop_loss(equity_view, self.stop_loss_pct):
+                    exit_fee_today += self.position.close_position(
                         y_close,
                         x_close,
                     )
-                    equity_view = self.account.cash
+                    equity_view = self.position.cash
+                    self.position.enforce_deactivation(equity_view)
                     exit_flag = True
                     force_close_reason = "stop_loss"
                     if self.stop_loss_cooling is not None:
@@ -560,32 +616,38 @@ class CointBacktester:
                         cooling_active_today = True
 
                 # (b) crossing exit (only if not stopped out)
-                elif self.account.should_exit_cross(
+                elif residual_today is not None and self.position.should_exit_cross(
                     prev_resid=prev_residual,
                     curr_resid=residual_today,
                     exit_k=self.exit_k,
                 ):
-                    exit_fee_today += self.account.close_position(
+                    exit_fee_today += self.position.close_position(
                         y_close,
                         x_close,
                     )
-                    equity_view = self.account.cash
+                    equity_view = self.position.cash
+                    self.position.enforce_deactivation(equity_view)
                     exit_flag = True
 
             # 6) if still flat and today is a reset day and we did not just switch above, do the periodic refit
             if (
-                self.account.can_enter()
+                self.position.can_enter()
                 and self._is_decision_day(bar_idx, first_decision_idx)
                 and not regime_switched
             ):
                 train = self.ex.window(bar_idx, self.train_len)
-                self.regime.fit_from_window(train, self.coint_var, self.pval_alpha)
+                self.regime.fit_from_window(
+                    train,
+                    self.coint_var,
+                    self.pval_alpha,
+                    force_active=not self.require_cointegration,
+                )
                 p_value_today = self.regime.p_value
                 beta1_today = self.regime.beta1
                 sigma_today = self.regime.sigma
                 residual_today = self.regime.residual(y_val, x_val)
 
-                regime_valid_to = min(bar_idx + self.gap - 1, self.end_idx)
+                regime_valid_to = min(bar_idx + self.reset_len - 1, self.end_idx)
                 self.regime.valid_from = bar_idx
                 self.regime.valid_to = regime_valid_to
 
@@ -612,12 +674,19 @@ class CointBacktester:
                 and (self.regime.valid_from is not None)
                 and (bar_idx >= self.regime.valid_from)
             )
-            entry_allowed_today = bool(
-                self.regime.active
-                and in_regime_window
-                and self.account.can_enter()
-                and not cooling_active_today
-            )
+            if self.require_cointegration:
+                entry_allowed_today = bool(
+                    self.regime.active
+                    and in_regime_window
+                    and self.position.can_enter()
+                    and not cooling_active_today
+                )
+            else:
+                entry_allowed_today = bool(
+                    in_regime_window
+                    and self.position.can_enter()
+                    and not cooling_active_today
+                )
 
             # 8) entry logic (unchanged apart from using possibly updated regime params)
             trade_signal = 0
@@ -636,7 +705,7 @@ class CointBacktester:
 
                 if residual_today >= self.entry_k * sigma_today:
                     # short spread
-                    entry_fee_today += self.account.open_short(
+                    entry_fee_today += self.position.open_short(
                         y_close,
                         x_close,
                         beta1_today,
@@ -649,7 +718,7 @@ class CointBacktester:
                     entry_side = -1
                 elif residual_today <= -self.entry_k * sigma_today:
                     # long spread
-                    entry_fee_today += self.account.open_long(
+                    entry_fee_today += self.position.open_long(
                         y_close,
                         x_close,
                         beta1_today,
@@ -660,19 +729,20 @@ class CointBacktester:
                     trade_signal = +1
                     entry_flag = True
                     entry_side = +1
-                equity_view = self.account.mark_to_market(y_close, x_close)
+                equity_view = self.position.mark_to_market(y_close, x_close)
+                self.position.enforce_deactivation(equity_view)
 
             # 9) if regime window ended and we are still flat, deactivate until next decision day
             if (
-                self.account.can_enter()
+                self.position.can_enter()
                 and regime_valid_to is not None
                 and bar_idx > regime_valid_to
             ):
                 self.regime.active = False
 
-            # 10) derive h_units from account if in position (for logging/plots)
-            if np.isnan(h_units_today) and self.account.qty_y != 0:
-                h_units_today = self.account.qty_x / self.account.qty_y
+            # 10) derive h_units from position if in position (for logging/plots)
+            if np.isnan(h_units_today) and self.position.qty_y != 0:
+                h_units_today = self.position.qty_x / self.position.qty_y
 
             # 11) daily log row (includes new fields for re-checks/forced exits/stops)
             self.daily.append(
@@ -690,16 +760,18 @@ class CointBacktester:
                     "entry_side": entry_side,
                     "position": (
                         0
-                        if self.account.state == "flat"
-                        else (1 if self.account.state == "long" else -1)
+                        if self.position.state == "flat"
+                        else (1 if self.position.state == "long" else -1)
                     ),
                     "pnl": equity_view,
-                    "state": self.account.state,
-                    "qty_y": self.account.qty_y,
-                    "qty_x": self.account.qty_x,
+                    "state": self.position.state,
+                    "qty_y": self.position.qty_y,
+                    "qty_x": self.position.qty_x,
                     "fee_entry": entry_fee_today,
                     "fee_exit": exit_fee_today,
-                    "fees_cumulative": self.account.cumulative_fees,
+                    "fees_cumulative": self.position.cumulative_fees,
+                    "cash": float(self.position.cash),
+                    "margin_used": float(self.position.entry_margin if self.position.state != "flat" else 0.0),
                     # new: fixed-beta re-check / forced close / stop-loss
                     "fixed_beta_check_done": fixed_beta_check_done,
                     "fixed_beta_p": fixed_beta_p,
@@ -707,7 +779,8 @@ class CointBacktester:
                     "fixed_beta_thr": fixed_beta_threshold_used,
                     "fixed_beta_fail": fixed_beta_failed,
                     "force_close_reason": force_close_reason,  # None | "stop_loss" | "no_longer_coint"
-                    "stop_k": self.stop_k,
+                    "stop_loss_pct": self.stop_loss_pct,
+                    "stop_k": self.stop_loss_pct,  # legacy column name for downstream plots
                     "exit_k": self.exit_k,
                     "relaxed_pval_alpha": self.relaxed_pval_alpha,
                     "cooldown_active": cooling_active_today,

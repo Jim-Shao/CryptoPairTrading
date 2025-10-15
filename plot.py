@@ -1,9 +1,3 @@
-#
-# File Name: plot.py
-# Modified Time: 2025-10-07 04:34:30
-#
-
-
 import os
 import math
 import matplotlib.pyplot as plt
@@ -12,6 +6,7 @@ import pandas as pd
 
 from utils import drop_warmup_rows
 from metrics import summarize_performance
+import matplotlib.dates as mdates
 
 
 _EXIT_MARKER_STYLES = {
@@ -290,17 +285,17 @@ def _trade_segments_from_daily(daily: pd.DataFrame) -> list[dict]:
                     if "qty_x" in daily.columns and pd.notna(daily.loc[e_idx, "qty_x"])
                     else None
                 ),
-                "stop_k": (
-                    float(daily.loc[e_idx, "stop_k"])
+                "stop_loss_pct": (
+                    float(daily.loc[e_idx, "stop_loss_pct"])
                     if (
-                        "stop_k" in daily.columns
-                        and pd.notna(daily.loc[e_idx, "stop_k"])
+                        "stop_loss_pct" in daily.columns
+                        and pd.notna(daily.loc[e_idx, "stop_loss_pct"])
                     )
                     else (
-                        float(daily.loc[e_idx, "exit_plus_k"])
+                        float(daily.loc[e_idx, "stop_k"])
                         if (
-                            "exit_plus_k" in daily.columns
-                            and pd.notna(daily.loc[e_idx, "exit_plus_k"])
+                            "stop_k" in daily.columns
+                            and pd.notna(daily.loc[e_idx, "stop_k"])
                         )
                         else None
                     )
@@ -332,7 +327,7 @@ def plot_trade_residual_spread_paths(
     *,
     entry_k: float = 2.0,
     exit_cross_k: float | None = None,
-    stop_k: float | None = None,
+    stop_loss_pct: float | None = None,
     max_trades: int | None = None,
     title_prefix: str = "[Residual & Spread] Trade paths",
     residual_label: str = "Residual",
@@ -351,12 +346,15 @@ def plot_trade_residual_spread_paths(
         legacy_kwargs.pop("exit_k", None)
         exit_cross_k = float(exit_cross_k)
 
-    if stop_k is None:
-        fallback = legacy_kwargs.pop("exit_plus_k", None)
-        stop_k = float(fallback) if fallback is not None else None
+    if stop_loss_pct is None:
+        fallback = legacy_kwargs.pop("stop_k", None)
+        if fallback is None:
+            fallback = legacy_kwargs.pop("exit_plus_k", None)
+        stop_loss_pct = float(fallback) if fallback is not None else None
     else:
+        legacy_kwargs.pop("stop_k", None)
         legacy_kwargs.pop("exit_plus_k", None)
-        stop_k = float(stop_k)
+        stop_loss_pct = float(stop_loss_pct)
 
     if legacy_kwargs:
         raise TypeError(f"Unexpected keyword arguments: {tuple(legacy_kwargs.keys())}")
@@ -471,35 +469,6 @@ def plot_trade_residual_spread_paths(
         if entry_res is None or not np.isfinite(entry_res):
             entry_res = window["residual"].iloc[0]
 
-        stop_val = seg.get("stop_k")
-        if stop_val is None and stop_k is not None:
-            stop_val = stop_k
-        if stop_val is not None:
-            try:
-                stop_val = float(stop_val)
-            except (TypeError, ValueError):
-                stop_val = np.nan
-
-        if (
-            stop_val is not None
-            and np.isfinite(stop_val)
-            and stop_val > 0
-            and np.isfinite(entry_res)
-        ):
-            if side == -1:
-                stop_line = entry_res + stop_val * es
-            elif side == 1:
-                stop_line = entry_res - stop_val * es
-            else:
-                stop_line = np.nan
-
-            if np.isfinite(stop_line):
-                ax.axhline(
-                    stop_line,
-                    linestyle="-.",
-                    color="tab:purple",
-                )
-
         ax.axhline(0.0, ls="--", c="red", lw=1.0)
         ax2.axhline(0.0, ls=":", c="gray", lw=1.0)
 
@@ -533,7 +502,13 @@ def plot_trade_residual_spread_paths(
                 trade_return = pnl_exit / pnl_entry - 1.0
                 return_suffix = f", return={trade_return:+.2%}"
         main_line = f"Trade {i}: {entry_time} → {exit_time}"
-        meta_line = f"{side_label}, exit={exit_reason}{return_suffix}"
+        stop_pct_seg = seg.get("stop_loss_pct")
+        if stop_pct_seg is None:
+            stop_pct_seg = stop_loss_pct
+        stop_suffix = ""
+        if stop_pct_seg is not None and np.isfinite(stop_pct_seg):
+            stop_suffix = f", stop={float(stop_pct_seg):.0%}"
+        meta_line = f"{side_label}, exit={exit_reason}{stop_suffix}{return_suffix}"
         ax.set_title(f"{main_line}\n{meta_line}")
         ax.set_ylabel(residual_label, color=residual_color)
         ax2.set_ylabel(spread_label, color=spread_color)
@@ -546,9 +521,15 @@ def plot_trade_residual_spread_paths(
         ax.spines["left"].set_color(residual_color)
         ax2.spines["right"].set_color(spread_color)
 
-    stop_label = f"{stop_k}" if stop_k is not None else "trade-specific"
+    if stop_loss_pct is not None:
+        try:
+            stop_label = f"{float(stop_loss_pct):.0%}"
+        except (TypeError, ValueError):
+            stop_label = str(stop_loss_pct)
+    else:
+        stop_label = "trade-specific"
     plt.suptitle(
-        f"{title_prefix} (k_entry={entry_k}, k_cross={exit_cross_k}, k_stop={stop_label})",
+        f"{title_prefix} (k_entry={entry_k}, k_cross={exit_cross_k}, stop_loss={stop_label})",
         y=1.02,
         fontsize=14,
     )
@@ -559,6 +540,58 @@ def plot_trade_residual_spread_paths(
     else:
         plt.show()
     plt.close()
+
+
+def plot_portfolio_equity(curve: pd.DataFrame, save_path: str | None = None) -> None:
+    df = curve.copy()
+    if df.empty:
+        return
+    if "time" not in df.columns or "portfolio_equity" not in df.columns:
+        return
+
+    times = pd.to_datetime(df["time"])
+    equity = pd.to_numeric(df["portfolio_equity"], errors="coerce")
+
+    if equity.isna().all():
+        return
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    ax.plot(times, equity, color="tab:blue", linewidth=1.5, label="Portfolio Equity")
+
+    if "portfolio_cash" in df.columns:
+        cash = pd.to_numeric(df["portfolio_cash"], errors="coerce")
+        if not cash.isna().all():
+            ax.plot(times, cash, color="tab:green", linewidth=1.2, label="Cash")
+
+    if "portfolio_margin_used" in df.columns:
+        margin = pd.to_numeric(df["portfolio_margin_used"], errors="coerce")
+        if not margin.isna().all():
+            ax.plot(times, margin, color="tab:orange", linewidth=1.2, label="Margin Used")
+
+    if "portfolio_fees" in df.columns:
+        fees = pd.to_numeric(df["portfolio_fees"], errors="coerce")
+        if not fees.isna().all():
+            ax.plot(times, fees, color="tab:red", linewidth=1.2, label="Fees (cum)")
+
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Value")
+    ax.set_title("Portfolio Metrics Over Time")
+    ax.grid(True, linestyle="--", alpha=0.4)
+    ax.legend(loc="best")
+
+    locator = mdates.AutoDateLocator()
+    formatter = mdates.ConciseDateFormatter(locator)
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(formatter)
+    fig.autofmt_xdate()
+
+    plt.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        plt.savefig(save_path, dpi=150)
+    else:
+        plt.show()
+    plt.close(fig)
 
 
 def plot_beta_and_pvalue(
