@@ -112,9 +112,14 @@ def grid_search_parameters(
             "entry_k": float(entry_k),
             "exit_k": float(exit_k),
         }
+        base_start = pd.to_datetime(start_time)
+        combo_start = base_start - pd.to_timedelta(params["train_len"], unit="h")
+        earliest_available = pd.to_datetime(exchange.time_index().min())
+        if combo_start < earliest_available:
+            combo_start = earliest_available
         run_kwargs = {
             "exchange": exchange,
-            "start_time": start_time,
+            "start_time": combo_start,
             "end_time": end_time,
             **bt_kwargs,
             **params,

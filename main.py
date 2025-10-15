@@ -93,8 +93,10 @@ def ensure_data_for_pairs(
         logger.info("All required data present for %d symbols.", len(symbols))
         return
 
-    for sym, months in missing_symbols.items():
-        logger.info("Missing %d months for %s: %s", len(months), sym, ", ".join(months))
+    for sym, miss_list in missing_symbols.items():
+        logger.info(
+            "Missing %d months for %s: %s", len(miss_list), sym, ", ".join(miss_list)
+        )
 
     bases = sorted(
         {sym[:-4] if sym.endswith("USDT") else sym for sym in missing_symbols}
@@ -243,6 +245,7 @@ def main(
     months_needed = _month_range(earliest_needed, TEST_END)
 
     ensure_data_for_pairs(pairs, months_needed)
+    symbols_needed = {sym for pair in pairs for sym in pair}
 
     cache_start = earliest_needed.strftime("%Y-%m-%d")
     cache_end = TEST_END.strftime("%Y-%m-%d")
@@ -252,6 +255,7 @@ def main(
         str(DATA_DIR),
         start_date=cache_start,
         end_date=cache_end,
+        symbols=symbols_needed,
     )
     logger.info("Loaded %d symbol-frequency datasets.", len(data_cache))
 
@@ -428,4 +432,4 @@ if __name__ == "__main__":
         force=True,
     )
     mp_ctx = mp.get_context("fork")
-    main(top_n=100, max_workers=os.cpu_count(), mp_context=mp_ctx)
+    main(top_n=30, max_workers=os.cpu_count() - 5, mp_context=mp_ctx)

@@ -249,9 +249,16 @@ class Portfolio:
             bt_kwargs.setdefault("trade_frac", 1.0)
             bt_kwargs.setdefault("initial_balance", allocation)
 
+            combo_start = spec.train_window[0] - pd.to_timedelta(
+                best_params.get("train_len", 0), unit="h"
+            )
+            earliest = pd.to_datetime(spec.exchange.time_index().min())
+            if combo_start < earliest:
+                combo_start = earliest
+
             bt = CointBacktester(
                 exchange=spec.exchange,
-                start_time=spec.test_window[0],
+                start_time=combo_start,
                 end_time=spec.test_window[1],
                 **bt_kwargs,
             )
@@ -295,7 +302,7 @@ class Portfolio:
             "cash": "cash",
             "margin_used": "margin_used",
             "fees_cumulative": "fees",
-            "position": "position",
+            "position": "active",
         }
 
         frames: list[pd.DataFrame] = []
@@ -309,9 +316,11 @@ class Portfolio:
             df = daily[["time", *use_cols]].copy()
             df["time"] = pd.to_datetime(df["time"])
             for col in use_cols:
-                df[f"{name}_{metrics_map[col]}"] = pd.to_numeric(
-                    df[col], errors="coerce"
-                )
+                series = pd.to_numeric(df[col], errors="coerce")
+                if col == "position":
+                    series = series.abs().clip(upper=1.0)
+                    series = series.where(series == 0, 1.0)
+                df[f"{name}_{metrics_map[col]}"] = series
             cols_to_keep = ["time", *[f"{name}_{metrics_map[c]}" for c in use_cols]]
             frames.append(df[cols_to_keep])
 
@@ -331,14 +340,25 @@ class Portfolio:
             merged = pd.merge(merged, df, on="time", how="outer")
 
         merged = merged.sort_values("time").reset_index(drop=True)
-        metric_suffixes = {"equity", "cash", "margin_used", "fees", "position"}
+        metric_suffixes = {"equity", "cash", "margin_used", "fees", "active"}
         for suffix in metric_suffixes:
             cols = [c for c in merged.columns if c.endswith(f"_{suffix}")]
             if cols:
                 merged[cols] = merged[cols].ffill()
                 merged[f"portfolio_{suffix}"] = merged[cols].sum(axis=1, min_count=1)
 
-        keep_cols = ["time", "portfolio_equity", "portfolio_fees", "portfolio_position"]
+        active_count_col = "portfolio_active"
+        if active_count_col in merged.columns:
+            merged[active_count_col] = merged[active_count_col].fillna(0.0)
+            merged["portfolio_active_ratio"] = merged[active_count_col] / max(len(self.pairs), 1)
+
+        keep_cols = [
+            "time",
+            "portfolio_equity",
+            "portfolio_fees",
+            "portfolio_active",
+            "portfolio_active_ratio",
+        ]
         for col in keep_cols:
             if col not in merged.columns:
                 merged[col] = float("nan")

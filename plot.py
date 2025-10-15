@@ -567,14 +567,26 @@ def plot_portfolio_equity(curve: pd.DataFrame, save_path: str | None = None) -> 
     ax_top.grid(True, linestyle="--", alpha=0.4)
     ax_top.legend(loc="best")
 
-    if "portfolio_position" in df.columns:
-        positions = pd.to_numeric(df["portfolio_position"], errors="coerce")
-        if not positions.isna().all():
-            ax_bottom.plot(times, positions, color="tab:orange", linewidth=1.2, label="Positions Active")
-            ax_bottom.set_ylabel("Active Pairs")
-            ax_bottom.set_title("Active Positions Count")
-            ax_bottom.grid(True, linestyle="--", alpha=0.4)
-            ax_bottom.legend(loc="best")
+    ratio = None
+    if "portfolio_active_ratio" in df.columns:
+        ratio = pd.to_numeric(df["portfolio_active_ratio"], errors="coerce")
+    count = None
+    if "portfolio_active" in df.columns:
+        count = pd.to_numeric(df["portfolio_active"], errors="coerce")
+
+    if ratio is not None and not ratio.isna().all():
+        ax_bottom.plot(times, ratio, color="tab:orange", linewidth=1.2, label="Active Pair Ratio")
+        ax_bottom.set_ylabel("Active Ratio")
+        ax_bottom.set_ylim(0, 1)
+        ax_bottom.set_title("Active Positions Ratio")
+        ax_bottom.grid(True, linestyle="--", alpha=0.4)
+        ax_bottom.legend(loc="best")
+    elif count is not None and not count.isna().all():
+        ax_bottom.plot(times, count, color="tab:orange", linewidth=1.2, label="Active Pairs")
+        ax_bottom.set_ylabel("Active Pairs")
+        ax_bottom.set_title("Active Positions Count")
+        ax_bottom.grid(True, linestyle="--", alpha=0.4)
+        ax_bottom.legend(loc="best")
 
     locator = mdates.AutoDateLocator()
     formatter = mdates.ConciseDateFormatter(locator)

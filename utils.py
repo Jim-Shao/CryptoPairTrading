@@ -4,10 +4,14 @@ import pandas as pd
 import statsmodels.api as sm
 from pandas.api.types import is_numeric_dtype
 from statsmodels.tsa.stattools import adfuller
+from typing import Iterable
 
 
 def load_crypto_dir(
-    data_dir: str, start_date: str = None, end_date: str = None
+    data_dir: str,
+    start_date: str = None,
+    end_date: str = None,
+    symbols: Iterable[str] | None = None,
 ) -> dict:
     """
     data_dir/symbol/freq/*.csv -> dict of DataFrames.
@@ -17,9 +21,13 @@ def load_crypto_dir(
     ed = pd.to_datetime(end_date) if end_date else None
 
     out = {}
+    allowed = {s.upper() for s in symbols} if symbols is not None else None
+
     for symbol in sorted(os.listdir(data_dir)):
         spath = os.path.join(data_dir, symbol)
         if not os.path.isdir(spath):
+            continue
+        if allowed is not None and symbol.upper() not in allowed:
             continue
         for freq in sorted(os.listdir(spath)):
             fpath = os.path.join(spath, freq)
