@@ -555,35 +555,33 @@ def plot_portfolio_equity(curve: pd.DataFrame, save_path: str | None = None) -> 
     if equity.isna().all():
         return
 
-    fig, ax = plt.subplots(figsize=(14, 6))
-    ax.plot(times, equity, color="tab:blue", linewidth=1.5, label="Portfolio Equity")
+    fig, (ax_top, ax_bottom) = plt.subplots(2, 1, sharex=True, figsize=(14, 8), height_ratios=[2, 1])
 
-    if "portfolio_cash" in df.columns:
-        cash = pd.to_numeric(df["portfolio_cash"], errors="coerce")
-        if not cash.isna().all():
-            ax.plot(times, cash, color="tab:green", linewidth=1.2, label="Cash")
-
-    if "portfolio_margin_used" in df.columns:
-        margin = pd.to_numeric(df["portfolio_margin_used"], errors="coerce")
-        if not margin.isna().all():
-            ax.plot(times, margin, color="tab:orange", linewidth=1.2, label="Margin Used")
-
+    ax_top.plot(times, equity, color="tab:blue", linewidth=1.5, label="Net Equity")
     if "portfolio_fees" in df.columns:
         fees = pd.to_numeric(df["portfolio_fees"], errors="coerce")
         if not fees.isna().all():
-            ax.plot(times, fees, color="tab:red", linewidth=1.2, label="Fees (cum)")
+            ax_top.plot(times, fees, color="tab:red", linewidth=1.2, label="Fees (cum)")
+    ax_top.set_ylabel("Value")
+    ax_top.set_title("Portfolio Net Equity & Fees")
+    ax_top.grid(True, linestyle="--", alpha=0.4)
+    ax_top.legend(loc="best")
 
-    ax.set_xlabel("Time")
-    ax.set_ylabel("Value")
-    ax.set_title("Portfolio Metrics Over Time")
-    ax.grid(True, linestyle="--", alpha=0.4)
-    ax.legend(loc="best")
+    if "portfolio_position" in df.columns:
+        positions = pd.to_numeric(df["portfolio_position"], errors="coerce")
+        if not positions.isna().all():
+            ax_bottom.plot(times, positions, color="tab:orange", linewidth=1.2, label="Positions Active")
+            ax_bottom.set_ylabel("Active Pairs")
+            ax_bottom.set_title("Active Positions Count")
+            ax_bottom.grid(True, linestyle="--", alpha=0.4)
+            ax_bottom.legend(loc="best")
 
     locator = mdates.AutoDateLocator()
     formatter = mdates.ConciseDateFormatter(locator)
-    ax.xaxis.set_major_locator(locator)
-    ax.xaxis.set_major_formatter(formatter)
+    ax_bottom.xaxis.set_major_locator(locator)
+    ax_bottom.xaxis.set_major_formatter(formatter)
     fig.autofmt_xdate()
+    ax_bottom.set_xlabel("Time")
 
     plt.tight_layout()
     if save_path:

@@ -295,6 +295,7 @@ class Portfolio:
             "cash": "cash",
             "margin_used": "margin_used",
             "fees_cumulative": "fees",
+            "position": "position",
         }
 
         frames: list[pd.DataFrame] = []
@@ -330,20 +331,14 @@ class Portfolio:
             merged = pd.merge(merged, df, on="time", how="outer")
 
         merged = merged.sort_values("time").reset_index(drop=True)
-        metric_suffixes = {"equity", "cash", "margin_used", "fees"}
+        metric_suffixes = {"equity", "cash", "margin_used", "fees", "position"}
         for suffix in metric_suffixes:
             cols = [c for c in merged.columns if c.endswith(f"_{suffix}")]
             if cols:
                 merged[cols] = merged[cols].ffill()
                 merged[f"portfolio_{suffix}"] = merged[cols].sum(axis=1, min_count=1)
 
-        keep_cols = [
-            "time",
-            "portfolio_equity",
-            "portfolio_cash",
-            "portfolio_margin_used",
-            "portfolio_fees",
-        ]
+        keep_cols = ["time", "portfolio_equity", "portfolio_fees", "portfolio_position"]
         for col in keep_cols:
             if col not in merged.columns:
                 merged[col] = float("nan")
