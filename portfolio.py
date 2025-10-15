@@ -362,6 +362,8 @@ class Portfolio:
             melted["metric"] = melted["metric"].map(metrics_map)
             long_frames.append(melted)
 
+        pairs_included = len(long_frames)
+
         if not long_frames:
             return pd.DataFrame(
                 columns=["time", "portfolio_equity", "portfolio_fees", "portfolio_active"]
@@ -393,6 +395,8 @@ class Portfolio:
         for col in ["portfolio_equity", "portfolio_fees", "portfolio_active"]:
             if col not in agg.columns:
                 agg[col] = float("nan")
+
+        agg.attrs["num_pairs"] = pairs_included
 
         return agg[["time", "portfolio_equity", "portfolio_fees", "portfolio_active"]]
 

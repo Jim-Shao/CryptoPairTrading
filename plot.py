@@ -543,6 +543,7 @@ def plot_trade_residual_spread_paths(
 
 
 def plot_portfolio_equity(curve: pd.DataFrame, save_path: str | None = None) -> None:
+    attr_pairs = getattr(curve, "attrs", {}).get("num_pairs")
     df = curve.copy()
     if df.empty:
         return
@@ -551,32 +552,108 @@ def plot_portfolio_equity(curve: pd.DataFrame, save_path: str | None = None) -> 
 
     times = pd.to_datetime(df["time"])
     equity = pd.to_numeric(df["portfolio_equity"], errors="coerce")
-
     if equity.isna().all():
         return
 
-    fig, (ax_top, ax_bottom) = plt.subplots(2, 1, sharex=True, figsize=(14, 8), height_ratios=[2, 1])
+    fees_series = None
+    if "portfolio_fees" in df.columns:
+        fees_series = pd.to_numeric(df["portfolio_fees"], errors="coerce")
+        if fees_series.isna().all():
+            fees_series = None
+
+    active = None
+    if "portfolio_active" in df.columns:
+        active = pd.to_numeric(df["portfolio_active"], errors="coerce")
+        if active.isna().all():
+            active = None
+
+    if attr_pairs is None and active is not None:
+        try:
+            attr_pairs = float(active.max())
+        except (TypeError, ValueError):
+            attr_pairs = None
+
+    metric_df = df[["time", "portfolio_equity"]].dropna(subset=["portfolio_equity"])
+    metric_df = metric_df.copy()
+    metric_df["time"] = pd.to_datetime(metric_df["time"])
+    perf_metrics = None
+    if not metric_df.empty:
+        try:
+            perf_metrics, _ = summarize_performance(
+                metric_df, pnl_col="portfolio_equity", time_col="time"
+            )
+        except Exception:
+            perf_metrics = None
+
+    first_time = pd.to_datetime(times.iloc[0])
+    last_time = pd.to_datetime(times.iloc[-1])
+    final_equity = float(equity.iloc[-1]) if np.isfinite(equity.iloc[-1]) else np.nan
+    final_fees = np.nan
+    if fees_series is not None and len(fees_series):
+        last_fee = fees_series.iloc[-1]
+        final_fees = float(last_fee) if np.isfinite(last_fee) else np.nan
+
+    fig, (ax_top, ax_bottom) = plt.subplots(
+        2, 1, sharex=True, figsize=(14, 8), height_ratios=[2, 1]
+    )
 
     ax_top.plot(times, equity, color="tab:blue", linewidth=1.5, label="Net Equity")
-    if "portfolio_fees" in df.columns:
-        fees = pd.to_numeric(df["portfolio_fees"], errors="coerce")
-        if not fees.isna().all():
-            ax_top.plot(times, fees, color="tab:red", linewidth=1.2, label="Fees (cum)")
+    if fees_series is not None:
+        ax_top.plot(
+            times,
+            fees_series,
+            color="tab:red",
+            linewidth=1.2,
+            label="Fees (cum)",
+        )
     ax_top.set_ylabel("Value")
-    ax_top.set_title("Portfolio Net Equity & Fees")
     ax_top.grid(True, linestyle="--", alpha=0.4)
     ax_top.legend(loc="best")
 
-    count = None
-    if "portfolio_active" in df.columns:
-        count = pd.to_numeric(df["portfolio_active"], errors="coerce")
-
-    if count is not None and not count.isna().all():
-        ax_bottom.plot(times, count, color="tab:orange", linewidth=1.2, label="Active Pairs")
+    if active is not None:
+        ax_bottom.plot(
+            times, active, color="tab:orange", linewidth=1.2, label="Active Pairs"
+        )
         ax_bottom.set_ylabel("Active Pairs")
         ax_bottom.set_title("Active Positions Count")
         ax_bottom.grid(True, linestyle="--", alpha=0.4)
         ax_bottom.legend(loc="best")
+
+    first_line = (
+        f"Portfolio Net Equity & Fees: {first_time.date()} → {last_time.date()}"
+    )
+    second_parts: list[str] = []
+    if attr_pairs is not None and np.isfinite(attr_pairs):
+        second_parts.append(f"pairs={int(attr_pairs)}")
+    if np.isfinite(final_equity):
+        second_parts.append(f"FinalEq={final_equity:,.2f}")
+    if np.isfinite(final_fees):
+        second_parts.append(f"Fees={final_fees:,.2f}")
+    second_line = " | ".join(second_parts) if second_parts else ""
+
+    metric_parts: list[str] = []
+    if perf_metrics:
+        ret = perf_metrics.get("Ret")
+        if ret is not None and np.isfinite(ret):
+            metric_parts.append(f"Ret={ret:+.2%}")
+        ann_ret = perf_metrics.get("AnnRet")
+        if ann_ret is not None and np.isfinite(ann_ret):
+            metric_parts.append(f"AnnRet={ann_ret:+.2%}")
+        ann_vol = perf_metrics.get("AnnVol")
+        if ann_vol is not None and np.isfinite(ann_vol):
+            metric_parts.append(f"AnnVol={ann_vol:.2%}")
+        sharpe = perf_metrics.get("Sharpe")
+        if sharpe is not None and np.isfinite(sharpe):
+            metric_parts.append(f"Sharpe={sharpe:.2f}")
+        max_dd = perf_metrics.get("MaxDrawdown")
+        if max_dd is not None and np.isfinite(max_dd):
+            metric_parts.append(f"MaxDD={max_dd:.2%}")
+    title_lines = [first_line]
+    if second_line:
+        title_lines.append(second_line)
+    if metric_parts:
+        title_lines.append(" | ".join(metric_parts))
+    ax_top.set_title("\n".join(title_lines))
 
     locator = mdates.AutoDateLocator()
     formatter = mdates.ConciseDateFormatter(locator)
