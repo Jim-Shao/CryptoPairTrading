@@ -543,7 +543,9 @@ def plot_trade_residual_spread_paths(
 
 
 def plot_portfolio_equity(curve: pd.DataFrame, save_path: str | None = None) -> None:
-    attr_pairs = getattr(curve, "attrs", {}).get("num_pairs")
+    attrs = getattr(curve, "attrs", {}) or {}
+    attr_pairs = attrs.get("num_pairs")
+    total_trades = attrs.get("total_trades")
     df = curve.copy()
     if df.empty:
         return
@@ -567,11 +569,25 @@ def plot_portfolio_equity(curve: pd.DataFrame, save_path: str | None = None) -> 
         if active.isna().all():
             active = None
 
-    if attr_pairs is None and active is not None:
-        try:
-            attr_pairs = float(active.max())
-        except (TypeError, ValueError):
-            attr_pairs = None
+    inactive = None
+    if "portfolio_inactive" in df.columns:
+        inactive = pd.to_numeric(df["portfolio_inactive"], errors="coerce")
+        if inactive.isna().all():
+            inactive = None
+
+    if attr_pairs is None:
+        candidate = None
+        if active is not None:
+            try:
+                candidate = float(active.max())
+            except (TypeError, ValueError):
+                candidate = None
+        if candidate is None and inactive is not None:
+            try:
+                candidate = float(inactive.max())
+            except (TypeError, ValueError):
+                candidate = None
+        attr_pairs = candidate
 
     metric_df = df[["time", "portfolio_equity"]].dropna(subset=["portfolio_equity"])
     metric_df = metric_df.copy()
@@ -597,27 +613,64 @@ def plot_portfolio_equity(curve: pd.DataFrame, save_path: str | None = None) -> 
         2, 1, sharex=True, figsize=(14, 8), height_ratios=[2, 1]
     )
 
-    ax_top.plot(times, equity, color="tab:blue", linewidth=1.5, label="Net Equity")
+    equity_line = ax_top.plot(
+        times, equity, color="tab:blue", linewidth=1.6, label="Portfolio Equity"
+    )
+    ax_top.set_ylabel("Equity")
+    ax_top.grid(True, linestyle="--", alpha=0.4)
+
+    fee_ax = None
     if fees_series is not None:
-        ax_top.plot(
+        fee_ax = ax_top.twinx()
+        fee_ax.spines["right"].set_color("tab:red")
+        fee_ax.set_ylabel("Fees", color="tab:red")
+        fee_ax.tick_params(axis="y", colors="tab:red")
+        fee_line = fee_ax.plot(
             times,
             fees_series,
             color="tab:red",
-            linewidth=1.2,
-            label="Fees (cum)",
+            linewidth=1.4,
+            linestyle="--",
+            label="Fees (cumulative)",
         )
-    ax_top.set_ylabel("Value")
-    ax_top.grid(True, linestyle="--", alpha=0.4)
-    ax_top.legend(loc="best")
+    else:
+        fee_line = []
 
+    legend_handles = list(equity_line)
+    legend_labels = [equity_line[0].get_label()]
+    if fee_ax is not None and fee_line:
+        legend_handles += fee_line
+        legend_labels += [fee_line[0].get_label()]
+    if legend_handles:
+        ax_top.legend(legend_handles, legend_labels, loc="best")
+
+    bottom_has_series = False
     if active is not None:
+        bottom_has_series = True
         ax_bottom.plot(
-            times, active, color="tab:orange", linewidth=1.2, label="Active Pairs"
+            times,
+            active,
+            color="tab:orange",
+            linewidth=1.3,
+            label="Open Positions",
         )
-        ax_bottom.set_ylabel("Active Pairs")
-        ax_bottom.set_title("Active Positions Count")
+    if inactive is not None:
+        bottom_has_series = True
+        ax_bottom.plot(
+            times,
+            inactive,
+            color="tab:purple",
+            linewidth=1.3,
+            label="Broken Pairs",
+        )
+
+    if bottom_has_series:
+        ax_bottom.set_ylabel("Count")
+        ax_bottom.set_title("Open vs Broken Pair Counts")
         ax_bottom.grid(True, linestyle="--", alpha=0.4)
         ax_bottom.legend(loc="best")
+    else:
+        ax_bottom.set_visible(False)
 
     first_line = (
         f"Portfolio Net Equity & Fees: {first_time.date()} → {last_time.date()}"
@@ -629,6 +682,25 @@ def plot_portfolio_equity(curve: pd.DataFrame, save_path: str | None = None) -> 
         second_parts.append(f"FinalEq={final_equity:,.2f}")
     if np.isfinite(final_fees):
         second_parts.append(f"Fees={final_fees:,.2f}")
+    if total_trades is not None:
+        try:
+            second_parts.append(f"Trades={int(total_trades)}")
+        except (TypeError, ValueError):
+            pass
+    if active is not None and len(active):
+        try:
+            final_active = float(active.iloc[-1])
+            if np.isfinite(final_active):
+                second_parts.append(f"Open={int(round(final_active))}")
+        except (TypeError, ValueError):
+            pass
+    if inactive is not None and len(inactive):
+        try:
+            final_inactive = float(inactive.iloc[-1])
+            if np.isfinite(final_inactive):
+                second_parts.append(f"Broken={int(round(final_inactive))}")
+        except (TypeError, ValueError):
+            pass
     second_line = " | ".join(second_parts) if second_parts else ""
 
     metric_parts: list[str] = []

@@ -101,9 +101,6 @@ def grid_search_parameters(
     log_prefix = bt_kwargs.pop("log_prefix", None)
     results: list[dict[str, Any]] = []
     run_records: list[dict[str, Any]] = []
-    successful_runs: list[
-        tuple[dict[str, Any], dict[str, Any], pd.DataFrame, pd.DataFrame]
-    ] = []
     total_combos = len(combos)
 
     for idx, (train_len, entry_k, exit_k) in enumerate(combos, start=1):
@@ -161,13 +158,10 @@ def grid_search_parameters(
                 "Error": None,
             }
             results.append(row)
-            successful_runs.append((params, metrics, daily, fits))
             run_records.append(
                 {
                     "params": params.copy(),
                     "metrics": metrics,
-                    "daily": daily,
-                    "fits": fits,
                     "error": None,
                 }
             )
@@ -179,7 +173,9 @@ def grid_search_parameters(
                 "Error": str(exc),
             }
             results.append(row)
-            run_records.append({"params": params.copy(), "error": str(exc)})
+            run_records.append(
+                {"params": params.copy(), "metrics": None, "error": str(exc)}
+            )
             if log_prefix:
                 logger.warning(
                     "[%s] Grid combo %d/%d failed: %s",
@@ -218,21 +214,51 @@ def grid_search_parameters(
     best_metrics: dict[str, Any] | None = None
     best_daily: pd.DataFrame | None = None
     best_fits: pd.DataFrame | None = None
+    selected_row: pd.Series | None = None
 
-    if successful_runs:
-        # match top-ranked row to stored runs
-        top = table.iloc[0]
-        for params, metrics, daily, fits in successful_runs:
-            if (
-                np.isclose(params["train_len"], top["train_len"])
-                and np.isclose(params["entry_k"], top["entry_k"])
-                and np.isclose(params["exit_k"], top["exit_k"])
-            ):
-                best_params = params
-                best_metrics = metrics
-                best_daily = daily
-                best_fits = fits
-                break
+    success_table = table.copy()
+    if "Error" in success_table.columns:
+        success_table = success_table[success_table["Error"].isna()].copy()
+    if success_table.empty:
+        success_table = table.copy()
+
+    if not success_table.empty:
+        sharpe_sorted = success_table.sort_values(
+            "Sharpe",
+            ascending=False,
+            na_position="last",
+        )
+        if not sharpe_sorted.empty:
+            selected_row = sharpe_sorted.iloc[0]
+        else:
+            selected_row = table.iloc[0]
+    elif not table.empty:
+        selected_row = table.iloc[0]
+
+    if selected_row is not None:
+        best_params = {
+            "train_len": int(selected_row["train_len"]),
+            "entry_k": float(selected_row["entry_k"]),
+            "exit_k": float(selected_row["exit_k"]),
+        }
+        base_start = pd.to_datetime(start_time)
+        combo_start = base_start - pd.to_timedelta(best_params["train_len"], unit="h")
+        earliest_available = pd.to_datetime(exchange.time_index().min())
+        if combo_start < earliest_available:
+            combo_start = earliest_available
+        best_run_kwargs = {
+            "exchange": exchange,
+            "start_time": combo_start,
+            "end_time": end_time,
+            **bt_kwargs,
+            **best_params,
+        }
+        bt_best = CointBacktester(**best_run_kwargs)
+        best_daily, best_fits = bt_best.run()
+        try:
+            best_metrics, _ = summarize_performance(best_daily, **metric_kwargs)
+        except Exception:
+            best_metrics = None
 
     return GridSearchSummary(
         table=table,

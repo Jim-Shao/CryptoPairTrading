@@ -106,7 +106,7 @@ def _test_single_pair(
 
     bt_kwargs = dict(spec.backtester_kwargs)
     bt_kwargs.update(best_params)
-    bt_kwargs.setdefault("trade_frac", 1.0)
+    bt_kwargs.setdefault("trade_frac", 0.1)
     bt_kwargs.setdefault("initial_balance", allocation)
 
     train_len_hours = int(best_params.get("train_len", 0))
@@ -211,7 +211,9 @@ class Portfolio:
                 )
         else:
             ctx = self.mp_context or mp.get_context()
-            with ProcessPoolExecutor(max_workers=self.max_workers, mp_context=ctx) as executor:
+            with ProcessPoolExecutor(
+                max_workers=self.max_workers, mp_context=ctx
+            ) as executor:
                 futures = {}
                 for spec in self.pairs:
                     _validate(spec)
@@ -260,11 +262,20 @@ class Portfolio:
             for spec in self.pairs:
                 summary = self._train_results.get(spec.name)
                 if summary is None:
-                    raise RuntimeError(f"No training result stored for pair '{spec.name}'.")
-                logger.info("Testing pair %s with params %s...", spec.name, summary.best_params)
-                name, daily, fits, metrics = _test_single_pair(spec, summary.best_params, allocation)
+                    raise RuntimeError(
+                        f"No training result stored for pair '{spec.name}'."
+                    )
+                logger.info(
+                    "Testing pair %s with params %s...", spec.name, summary.best_params
+                )
+                name, daily, fits, metrics = _test_single_pair(
+                    spec, summary.best_params, allocation
+                )
                 if daily is None:
-                    logger.warning("Skipping test run for %s (no valid training results).", spec.name)
+                    logger.warning(
+                        "Skipping test run for %s (no valid training results).",
+                        spec.name,
+                    )
                 runs[name] = PairRunResult(
                     pair=spec,
                     train_summary=summary,
@@ -273,7 +284,9 @@ class Portfolio:
                     test_metrics=metrics,
                 )
                 final_equity = (
-                    float(daily["pnl"].iloc[-1]) if daily is not None and not daily.empty else float("nan")
+                    float(daily["pnl"].iloc[-1])
+                    if daily is not None and not daily.empty
+                    else float("nan")
                 )
                 logger.info(
                     "Completed test for %s | Sharpe=%s | FinalEquity=%.2f",
@@ -283,13 +296,21 @@ class Portfolio:
                 )
         else:
             ctx = self.mp_context or mp.get_context()
-            with ProcessPoolExecutor(max_workers=self.max_workers, mp_context=ctx) as executor:
+            with ProcessPoolExecutor(
+                max_workers=self.max_workers, mp_context=ctx
+            ) as executor:
                 futures = {}
                 for spec in self.pairs:
                     summary = self._train_results.get(spec.name)
                     if summary is None:
-                        raise RuntimeError(f"No training result stored for pair '{spec.name}'.")
-                    futures[executor.submit(_test_single_pair, spec, summary.best_params, allocation)] = spec.name
+                        raise RuntimeError(
+                            f"No training result stored for pair '{spec.name}'."
+                        )
+                    futures[
+                        executor.submit(
+                            _test_single_pair, spec, summary.best_params, allocation
+                        )
+                    ] = spec.name
 
                 for fut in as_completed(futures):
                     name = futures[fut]
@@ -297,7 +318,10 @@ class Portfolio:
                     spec = spec_map[name]
                     name_res, daily, fits, metrics = fut.result()
                     if daily is None:
-                        logger.warning("Skipping test run for %s (no valid training results).", name_res)
+                        logger.warning(
+                            "Skipping test run for %s (no valid training results).",
+                            name_res,
+                        )
                     runs[name_res] = PairRunResult(
                         pair=spec,
                         train_summary=summary,
@@ -306,7 +330,9 @@ class Portfolio:
                         test_metrics=metrics,
                     )
                     final_equity = (
-                        float(daily["pnl"].iloc[-1]) if daily is not None and not daily.empty else float("nan")
+                        float(daily["pnl"].iloc[-1])
+                        if daily is not None and not daily.empty
+                        else float("nan")
                     )
                     logger.info(
                         "Completed test for %s | Sharpe=%s | FinalEquity=%.2f",
@@ -333,13 +359,22 @@ class Portfolio:
             "pnl": "equity",
             "fees_cumulative": "fees",
             "position": "active",
+            "deactivated": "inactive",
         }
 
         long_frames: list[pd.DataFrame] = []
+        total_trades = 0
         for result in self._pair_runs.values():
             daily = result.test_daily
             if daily is None or daily.empty:
                 continue
+            entry_series = daily.get("entry_flag")
+            if entry_series is not None:
+                try:
+                    entry_vals = pd.to_numeric(entry_series, errors="coerce").fillna(0.0)
+                    total_trades += int(entry_vals.sum())
+                except Exception:
+                    pass
             use_cols = [c for c in metrics_map if c in daily.columns]
             if not use_cols:
                 continue
@@ -351,6 +386,8 @@ class Portfolio:
                 if col == "position":
                     series = series.abs().clip(upper=1.0)
                     series = series.where(series == 0, 1.0)
+                elif col == "deactivated":
+                    series = series.fillna(method="ffill").fillna(0.0)
                 df[col] = series
             df[use_cols] = df[use_cols].ffill()
             melted = df.melt(
@@ -365,12 +402,23 @@ class Portfolio:
         pairs_included = len(long_frames)
 
         if not long_frames:
-            return pd.DataFrame(
-                columns=["time", "portfolio_equity", "portfolio_fees", "portfolio_active"]
+            empty = pd.DataFrame(
+                columns=[
+                    "time",
+                    "portfolio_equity",
+                    "portfolio_fees",
+                    "portfolio_active",
+                    "portfolio_inactive",
+                ]
             )
+            empty.attrs["num_pairs"] = 0
+            empty.attrs["total_trades"] = total_trades
+            return empty
 
         agg = pd.concat(long_frames, ignore_index=True)
-        agg = agg.groupby(["time", "metric"], sort=True)["value"].sum().unstack("metric")
+        agg = (
+            agg.groupby(["time", "metric"], sort=True)["value"].sum().unstack("metric")
+        )
         agg = agg.sort_index().reset_index()
 
         test_start = max(spec.test_window[0] for spec in self.pairs)
@@ -381,24 +429,50 @@ class Portfolio:
                 "equity": "portfolio_equity",
                 "fees": "portfolio_fees",
                 "active": "portfolio_active",
+                "inactive": "portfolio_inactive",
             },
             inplace=True,
         )
 
-        numeric_cols = [c for c in ["portfolio_equity", "portfolio_fees", "portfolio_active"] if c in agg.columns]
+        numeric_cols = [
+            c
+            for c in [
+                "portfolio_equity",
+                "portfolio_fees",
+                "portfolio_active",
+                "portfolio_inactive",
+            ]
+            if c in agg.columns
+        ]
         agg[numeric_cols] = agg[numeric_cols].fillna(method="ffill")
         if "portfolio_fees" in agg.columns:
             agg["portfolio_fees"] = agg["portfolio_fees"].fillna(0.0)
         if "portfolio_active" in agg.columns:
             agg["portfolio_active"] = agg["portfolio_active"].fillna(0.0)
+        if "portfolio_inactive" in agg.columns:
+            agg["portfolio_inactive"] = agg["portfolio_inactive"].fillna(0.0)
 
-        for col in ["portfolio_equity", "portfolio_fees", "portfolio_active"]:
+        for col in [
+            "portfolio_equity",
+            "portfolio_fees",
+            "portfolio_active",
+            "portfolio_inactive",
+        ]:
             if col not in agg.columns:
                 agg[col] = float("nan")
 
-        agg.attrs["num_pairs"] = pairs_included
-
-        return agg[["time", "portfolio_equity", "portfolio_fees", "portfolio_active"]]
+        result = agg[
+            [
+                "time",
+                "portfolio_equity",
+                "portfolio_fees",
+                "portfolio_active",
+                "portfolio_inactive",
+            ]
+        ].copy()
+        result.attrs["num_pairs"] = pairs_included
+        result.attrs["total_trades"] = total_trades
+        return result
 
     @property
     def pair_runs(self) -> Dict[str, PairRunResult]:

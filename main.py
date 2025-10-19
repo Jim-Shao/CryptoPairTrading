@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import multiprocessing as mp
 import os
@@ -32,9 +33,9 @@ DATA_ROOT = DATA_DIR.parent
 PAIR_CSV = Path("/home/jim/CryptoPairTrading/export_after_signal_test.csv")
 OUTPUT_DIR = Path("runs/portfolio")
 
-TRAIN_START = pd.Timestamp("2023-01-01")
-TRAIN_END = pd.Timestamp("2024-12-31")
-TEST_START = pd.Timestamp("2025-01-01")
+TRAIN_START = pd.Timestamp("2023-03-01")
+TRAIN_END = pd.Timestamp("2025-02-28")
+TEST_START = pd.Timestamp("2025-03-01")
 TEST_END = pd.Timestamp("2025-09-30")
 
 GRID_TRAIN_LEN = [30 * 24, 60 * 24, 120 * 24, 180 * 24]
@@ -43,16 +44,17 @@ GRID_EXIT_K = [0, 0.5]
 
 INITIAL_BALANCE = 1_000_000.0
 RESET_LEN = 24
-DEACTIVATE_EQUITY_RATIO = 0.50
+DEACTIVATE_EQUITY_RATIO = 0.20
 DEFAULT_BACKTEST_KWARGS = dict(
     require_cointegration=True,
     reset_len=RESET_LEN,
-    pval_alpha=0.05,
+    pval_alpha=0.1,
     exit_k=0.5,
-    relaxed_pval_alpha=0.20,
+    relaxed_pval_alpha=0.50,
     stop_loss_pct=0.20,
-    stop_loss_cooling_days=3.0,
+    stop_loss_cooling_days=5.0,
     margin_rate=0.10,
+    trade_frac=0.50,
     fee_rate=5e-4,
     deactivate_equity_ratio=DEACTIVATE_EQUITY_RATIO,
 )
@@ -229,6 +231,11 @@ def main(
             output_dir = OUTPUT_DIR.parent / f"{OUTPUT_DIR.name}_{safe_tag}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    params_path = output_dir / "backtest_params.json"
+    with params_path.open("w", encoding="utf-8") as params_file:
+        json.dump(DEFAULT_BACKTEST_KWARGS, params_file, indent=2, sort_keys=True)
+    logger.info("Saved backtest parameters to %s", params_path)
+
     mp_ctx = mp_context or mp.get_context("fork")
 
     logger.info("Loading top %d pairs from %s...", top_n, PAIR_CSV)
@@ -318,12 +325,40 @@ def main(
     best_plot_bar = tqdm(
         total=len(train_results), desc="Training plots", dynamic_ncols=True
     )
+    train_best_rows: list[dict[str, object]] = []
     for name, summary in train_results.items():
+        row: dict[str, object] = {"pair": name}
+        best_params = summary.best_params or {}
+        best_metrics = summary.best_metrics or {}
+        top_row = (
+            summary.table.iloc[0]
+            if summary.table is not None and not summary.table.empty
+            else None
+        )
+        if "train_len" in best_params:
+            row["train_len"] = best_params["train_len"]
+        elif top_row is not None and pd.notna(top_row.get("train_len")):
+            row["train_len"] = int(top_row["train_len"])
+        if "entry_k" in best_params:
+            row["entry_k"] = best_params["entry_k"]
+        elif top_row is not None and pd.notna(top_row.get("entry_k")):
+            row["entry_k"] = float(top_row["entry_k"])
+        if "exit_k" in best_params:
+            row["exit_k"] = best_params["exit_k"]
+        elif top_row is not None and pd.notna(top_row.get("exit_k")):
+            row["exit_k"] = float(top_row["exit_k"])
+        if top_row is not None:
+            for col in ("Trades", "Exits", "FinalEquity"):
+                if col in top_row:
+                    row[col] = top_row[col]
+        for key, value in best_metrics.items():
+            row[key] = value
+        train_best_rows.append(row)
+
         spec = spec_map.get(name)
         if spec is None:
             best_plot_bar.update(1)
             continue
-        best_params = summary.best_params or {}
         best_daily = summary.best_daily
         best_fits = summary.best_fits
         if best_daily is None or best_daily.empty:
@@ -370,24 +405,65 @@ def main(
         summary.best_fits = None
     best_plot_bar.close()
 
+    if train_best_rows:
+        train_best_df = pd.DataFrame(train_best_rows)
+        train_best_df = train_best_df.sort_values("pair").reset_index(drop=True)
+        train_best_path = output_dir / "train_pair_summary.csv"
+        train_best_df.to_csv(train_best_path, index=False)
+        logger.info("Saved best-train summary table to %s", train_best_path)
+
+    test_best_rows: list[dict[str, object]] = []
     for name, result in test_results.items():
         pair_dir = output_dir / name
         pair_dir.mkdir(parents=True, exist_ok=True)
 
+        row: dict[str, object] = {"pair": name}
+        best_params = result.train_summary.best_params or {}
+        row["train_len"] = best_params.get("train_len")
+        row["entry_k"] = best_params.get("entry_k")
+        row["exit_k"] = best_params.get("exit_k")
+
         daily = result.test_daily
+        train_len_val = best_params.get("train_len")
+        entry_k_val = best_params.get("entry_k")
+        exit_k_val = best_params.get("exit_k")
+
         if daily is not None and not daily.empty:
+            entry_flags = daily.get("entry_flag")
+            exit_flags = daily.get("exit_flag")
+            if entry_flags is not None:
+                entry_series = pd.to_numeric(pd.Series(entry_flags), errors="coerce")
+                row["Trades"] = int(entry_series.fillna(0).sum())
+            if exit_flags is not None:
+                exit_series = pd.to_numeric(pd.Series(exit_flags), errors="coerce")
+                row["Exits"] = int(exit_series.fillna(0).sum())
+            pnl_series = pd.to_numeric(daily["pnl"], errors="coerce")
+            if not pnl_series.empty and pd.notna(pnl_series.iloc[-1]):
+                row["FinalEquity"] = float(pnl_series.iloc[-1])
+            if "fees_cumulative" in daily.columns:
+                fees_series = pd.to_numeric(daily["fees_cumulative"], errors="coerce")
+                if not fees_series.empty and pd.notna(fees_series.iloc[-1]):
+                    row["FinalFees"] = float(fees_series.iloc[-1])
+
             daily_path = pair_dir / "test_daily.csv"
             daily.to_csv(daily_path, index=False)
             logger.info("Saved test daily log for %s to %s", name, daily_path)
 
-            best_params = result.train_summary.best_params or {}
-            entry_k = best_params.get("entry_k", GRID_ENTRY_K[0])
-            exit_k = best_params.get(
-                "exit_k", DEFAULT_BACKTEST_KWARGS.get("exit_k", 0.5)
+            entry_k = entry_k_val if entry_k_val is not None else GRID_ENTRY_K[0]
+            exit_k = (
+                exit_k_val
+                if exit_k_val is not None
+                else DEFAULT_BACKTEST_KWARGS.get("exit_k", 0.5)
             )
             stop_loss_pct = DEFAULT_BACKTEST_KWARGS.get("stop_loss_pct")
 
-            title_prefix = f"{name} [Test]"
+            train_len_fmt = (
+                f"{int(train_len_val)}" if train_len_val is not None else "?"
+            )
+            title_prefix = (
+                f"{name} [Test] train_len={train_len_fmt}, "
+                f"entry_k={float(entry_k):.3f}, exit_k={float(exit_k):.3f}"
+            )
             plot_equity_with_trades(
                 daily,
                 title=f"{title_prefix} Equity Curve",
@@ -417,6 +493,11 @@ def main(
             pd.Series(result.test_metrics).to_csv(metrics_path)
             logger.info("Saved test metrics for %s to %s", name, metrics_path)
 
+        metrics = result.test_metrics or {}
+        for key, value in metrics.items():
+            row[key] = value
+        test_best_rows.append(row)
+
     if not equity_curve.empty:
         port_path = output_dir / "portfolio_equity.csv"
         equity_curve.to_csv(port_path, index=False)
@@ -428,13 +509,20 @@ def main(
     else:
         logger.warning("Portfolio equity curve is empty; nothing saved.")
 
+    if test_best_rows:
+        test_best_df = pd.DataFrame(test_best_rows)
+        test_best_df = test_best_df.sort_values("pair").reset_index(drop=True)
+        test_best_path = output_dir / "test_pair_summary.csv"
+        test_best_df.to_csv(test_best_path, index=False)
+        logger.info("Saved best-test summary table to %s", test_best_path)
+
     logger.info("Backtest workflow complete.")
 
 
 if __name__ == "__main__":
-    RUN_TAG = "coint"  # e.g. "no_coint_run"
+    RUN_TAG = "coint_1018_20stop"  # e.g. "no_coint_run"
     TOP_N = 100
-    MAX_WORKERS = os.cpu_count() - 5
+    MAX_WORKERS = os.cpu_count() - 2
 
     logging.basicConfig(
         filename="backtest.log",

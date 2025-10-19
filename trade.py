@@ -785,6 +785,7 @@ class CointBacktester:
                     "relaxed_pval_alpha": self.relaxed_pval_alpha,
                     "cooldown_active": cooling_active_today,
                     "cooldown_until": self.cooldown_until_time,
+                    "deactivated": bool(self.position.deactivated),
                 }
             )
 
