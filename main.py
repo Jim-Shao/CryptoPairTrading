@@ -30,15 +30,15 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 DATA_DIR = Path("/home/jim/CryptoPairTrading/data/futures")
 DATA_ROOT = DATA_DIR.parent
-PAIR_CSV = Path("/home/jim/CryptoPairTrading/export_after_signal_test.csv")
+PAIR_CSV = Path("/home/jim/CryptoPairTrading/output_chain.csv")
 OUTPUT_DIR = Path("runs/portfolio")
 
-TRAIN_START = pd.Timestamp("2023-03-01")
+TRAIN_START = pd.Timestamp("2023-02-28")
 TRAIN_END = pd.Timestamp("2025-02-28")
 TEST_START = pd.Timestamp("2025-03-01")
 TEST_END = pd.Timestamp("2025-09-30")
 
-GRID_TRAIN_LEN = [30 * 24, 60 * 24, 120 * 24, 180 * 24]
+GRID_TRAIN_LEN = [7 * 24, 15 * 24, 30 * 24, 90 * 24, 180 * 24]
 GRID_ENTRY_K = [0.8, 1.0, 1.5, 2.0, 2.5, 3.0]
 GRID_EXIT_K = [0, 0.5]
 
@@ -520,9 +520,9 @@ def main(
 
 
 if __name__ == "__main__":
-    RUN_TAG = "coint_1018_20stop"  # e.g. "no_coint_run"
+    RUN_TAG = "1110_no_coint_T1reduced"  # e.g. "no_coint_run"
     TOP_N = 100
-    MAX_WORKERS = os.cpu_count() - 2
+    MAX_WORKERS = os.cpu_count() - 7
 
     logging.basicConfig(
         filename="backtest.log",
